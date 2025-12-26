@@ -8,16 +8,16 @@
 Intake ──gRPC──► Engine ──gRPC──► Module ──gRPC──► Engine ──gRPC──► Module ──gRPC──► ...
 ```
 
-**Kafka is for specific edges** where asynchronous, buffered, or cross-cluster transport is needed.
+**Kafka is for specific edges** where asynchronous, buffered, or replay capability is needed.
 
-## Transport Types
+## One Transport Per Edge
 
-Transport is defined on **edges**, not nodes. Each edge specifies how to reach its target:
+Each edge in the graph chooses ONE transport - no mixing:
 
-| Transport | Proto Value | Use Case | Behavior |
-|-----------|-------------|----------|----------|
-| **gRPC** | `TRANSPORT_TYPE_GRPC` | Default, real-time, most processing | Direct call, low latency |
-| **Kafka** | `TRANSPORT_TYPE_MESSAGING` | Cross-cluster, async buffering, batch | Buffered, requires persistence |
+| Transport | Flow | Use Case |
+|-----------|------|----------|
+| **gRPC** | Engine → Engine (direct) | Fast path, low latency |
+| **Kafka** | Engine → Repo → Kafka → Sidecar → Engine | Async, replayable |
 
 ## Edge Definition
 
@@ -35,78 +35,81 @@ message GraphEdge {
   string condition = 6;
   int32 priority = 7;
   
-  // Transport
-  TransportType transport_type = 8;
-  optional string kafka_topic = 9;  // Override default if Kafka
+  // Transport selection
+  TransportType transport_type = 8;    // GRPC or MESSAGING
+  optional string kafka_topic = 9;     // Override default if Kafka
   
   // Loop prevention
   int32 max_hops = 10;
 }
 ```
 
-## gRPC Transport (Primary)
+## gRPC Transport (Fast Path)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     gRPC FLOW (TYPICAL)                          │
-│                                                                  │
-│  Engine ────gRPC call────► Module                               │
-│     │                         │                                  │
-│     │   PipeDoc inline        │   PipeDoc inline                │
-│     │   (no persistence)      │   (no persistence)              │
-│     │                         │                                  │
-│     │◄────gRPC response───────┘                                  │
-│     │                                                            │
-│     └────gRPC call────► Next Engine/Module                      │
-│                                                                  │
-│  Benefits:                                                       │
-│  • Low latency (no Kafka hop)                                   │
-│  • No mandatory persistence                                     │
-│  • Simple request/response                                      │
-│  • 2GB payload limit (plenty for most docs)                     │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                     gRPC FLOW (DEFAULT)                                          │
+│                                                                                  │
+│  Engine A ────────gRPC call────────► Engine B                                   │
+│      │                                    │                                      │
+│      │   PipeStream with inline PipeDoc   │                                      │
+│      │   No persistence required          │                                      │
+│      │   Immediate processing             │                                      │
+│      │                                    │                                      │
+│  Benefits:                                                                       │
+│  • Lowest latency (no Kafka hop)                                                │
+│  • No mandatory persistence                                                     │
+│  • Simple request/response                                                      │
+│  • 2GB payload limit (plenty for most docs)                                     │
+│                                                                                  │
+│  Limitations:                                                                   │
+│  • No replay capability                                                         │
+│  • Caller waits for response                                                    │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**When to use gRPC:**
-- Default for all edges unless Kafka is specifically needed
-- Latency-sensitive processing
-- Small to medium documents
-- Same-cluster routing
-
-## Kafka Transport (Specific Edges)
+## Kafka Transport (Async/Replay Path)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     KAFKA FLOW                                   │
-│                                                                  │
-│  Engine ──► Repo.SavePipeDoc() ──► S3                           │
-│     │                                                            │
-│     └──► Kafka.publish(topic, PipeStream with document_ref)     │
-│                           │                                      │
-│                           ▼                                      │
-│                    ┌──────────────┐                             │
-│                    │    Kafka     │                             │
-│                    │   (buffered) │                             │
-│                    └──────────────┘                             │
-│                           │                                      │
-│                           ▼                                      │
-│  Target Engine ◄── Kafka.consume()                              │
-│     │                                                            │
-│     └──► Repo.GetPipeDoc(document_ref) ──► S3                   │
-│                                                                  │
-│  Constraints:                                                    │
-│  • 10MB message limit → MUST use document_ref                   │
-│  • Requires persistence before publish                          │
-│  • Adds latency (Kafka + S3 round trips)                        │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                     KAFKA FLOW                                                   │
+│                                                                                  │
+│  Engine A                                                                        │
+│      │                                                                           │
+│      ├──► Repo.SavePipeDoc() ──► S3 (persist document)                          │
+│      │                                                                           │
+│      └──► Kafka.publish(topic, PipeStream with document_ref)                    │
+│                          │                                                       │
+│                          ▼                                                       │
+│                    ┌──────────┐                                                  │
+│                    │  Kafka   │  (10MB limit, so only document_ref)             │
+│                    └──────────┘                                                  │
+│                          │                                                       │
+│                          ▼                                                       │
+│                    ┌──────────┐                                                  │
+│                    │ Sidecar  │  (Consul lease for this topic)                  │
+│                    │ • Consume│                                                  │
+│                    │ • Hydrate│──► Repo.GetPipeDoc() ──► S3                     │
+│                    └──────────┘                                                  │
+│                          │                                                       │
+│                          ▼ localhost gRPC                                        │
+│                    ┌──────────┐                                                  │
+│                    │ Engine B │  (receives hydrated PipeStream)                 │
+│                    └──────────┘                                                  │
+│                                                                                  │
+│  Benefits:                                                                       │
+│  • Replay capability (rewind offset)                                            │
+│  • Async (fire and forget from Engine A's perspective)                          │
+│  • Natural buffering during load spikes                                         │
+│  • Cross-cluster routing                                                        │
+│                                                                                  │
+│  Limitations:                                                                   │
+│  • Higher latency (Kafka + S3 round trips)                                      │
+│  • Requires persistence                                                         │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
-
-**When to use Kafka:**
-- Cross-cluster routing
-- Batch ingestion buffering
-- Decoupling (producer doesn't wait for consumer)
-- Replay/reprocessing capability needed
-- Large documents (over gRPC comfort zone)
 
 ## CEL Conditional Routing
 
@@ -174,16 +177,17 @@ void routeToNextNode(PipeStream stream, PipeDoc doc, GraphEdge edge) {
                 .setAccountId(accountId)
                 .build())
             .setCurrentNodeId(edge.getToNodeId())
+            .setHopCount(stream.getHopCount() + 1)
             .build();
         
         String topic = edge.hasKafkaTopic() 
             ? edge.getKafkaTopic()
-            : graphCache.getNode(edge.getToNodeId()).getKafkaInputTopic();
+            : getDefaultTopic(edge.getToNodeId());
         
         kafkaProducer.send(topic, dehydrated);
         
     } else {
-        // GRPC: Can pass inline (default) or reference (large docs)
+        // GRPC: Pass inline, no persistence required
         PipeStream next = stream.toBuilder()
             .setCurrentNodeId(edge.getToNodeId())
             .setDocument(doc)
@@ -193,7 +197,8 @@ void routeToNextNode(PipeStream stream, PipeDoc doc, GraphEdge edge) {
         if (edge.getIsCrossCluster()) {
             engineClient.routeToCluster(edge.getToClusterId(), next);
         } else {
-            processNode(next);  // Local recursive call or queue
+            // Direct gRPC call to engine handling that node
+            engineClient.processNode(next);
         }
     }
 }
@@ -202,27 +207,32 @@ void routeToNextNode(PipeStream stream, PipeDoc doc, GraphEdge edge) {
 ## Topic Naming Convention
 
 ```
-{environment}.{cluster}.{node-uuid}
+pipestream.{cluster-id}.{node-uuid}
 
 Examples:
-prod.us-east.abc123-def456-parser-node
-prod.us-east.xyz789-chunker-node
-staging.default.test-embedder-node
+pipestream.prod-us-east.abc123-def456-parser-node
+pipestream.prod-us-east.xyz789-chunker-node
+pipestream.staging.test-embedder-node
+
+DLQ:
+dlq.{cluster-id}.{node-uuid}
 ```
 
-## Cross-Cluster Routing
+## Graph Node Creates Topics
 
-When `edge.is_cross_cluster = true`:
+When a node is created that has incoming Kafka edges:
 
 ```java
-void routeCrossCluster(PipeStream stream, PipeDoc doc, GraphEdge edge) {
-    // Always use Kafka for cross-cluster (reliability + decoupling)
-    // Same as Kafka transport above, but target topic is in different cluster
-    
-    String bridgeTopic = edge.hasKafkaTopic()
-        ? edge.getKafkaTopic()
-        : "bridge." + edge.getToClusterId() + "." + edge.getToNodeId();
-    
-    // ... persist and publish
+void onNodeCreated(GraphNode node) {
+    if (hasIncomingKafkaEdges(node)) {
+        String topicName = "pipestream." + node.getClusterId() + "." + node.getNodeId();
+        kafkaAdmin.createTopic(topicName, partitions, replicationFactor);
+        
+        String dlqTopic = "dlq." + node.getClusterId() + "." + node.getNodeId();
+        kafkaAdmin.createTopic(dlqTopic, partitions, replicationFactor);
+        
+        // Register in Consul for sidecar lease distribution
+        consul.kvPut("pipestream/topics/" + node.getNodeId(), "");
+    }
 }
 ```
