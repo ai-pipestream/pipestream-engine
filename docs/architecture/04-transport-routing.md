@@ -1,4 +1,4 @@
-# Transport & Routing
+# Transport &amp; Routing
 
 Transport and routing manage how documents move between processing nodes in the Pipestream ecosystem. The engine supports two primary transport mechanisms—synchronous gRPC for low-latency flows and asynchronous Kafka for durable, replayable pipelines—allowing each connection (edge) in the graph to choose the most appropriate path.
 
@@ -239,7 +239,7 @@ flowchart TD
 The routing system integrates directly with Kafka and Consul to manage the underlying physical infrastructure required for messaging.
 
 ### Topic Management
-- **Deterministic Naming**: Topics follow the pattern `pipestream.{cluster}.{node_uuid}` for clear ownership.
+- **Deterministic Naming**: Topics follow the pattern `pipestream.{cluster}.{node_uuid}` for node topics.
 - **Automatic Provisioning**: The system creates both the main data topic and a corresponding Dead Letter Queue (DLQ) for every Kafka-enabled node.
 - **Service Discovery**: Node-to-topic mappings are registered in Consul, allowing Sidecars to dynamically discover which topics they should consume.
 
@@ -256,8 +256,8 @@ void onNodeCreated(GraphNode node) {
         String dlqTopic = "dlq." + node.getClusterId() + "." + node.getNodeId();
         kafkaAdmin.createTopic(dlqTopic, partitions, replicationFactor);
         
-        // 4. Registration phase (4)
-        consul.kvPut("pipestream/topics/" + node.getNodeId(), topicName);
+        // 4. Registration in Consul for sidecar lease distribution (4)
+        consul.kvPut("pipestream/node-topics/" + node.getClusterId() + "." + node.getNodeId(), "");
     }
 }
 ```
@@ -266,4 +266,4 @@ void onNodeCreated(GraphNode node) {
 1. **Naming Convention**: Uses a deterministic pattern including the cluster and node ID to ensure topic uniqueness across global deployments.
 2. **Infrastructure Provisioning**: Dynamically creates the Kafka topic if the graph defines that this node receives data via messaging.
 3. **Dead Letter Queue**: Automatically provisions a corresponding DLQ topic to ensure that poison messages can be isolated without affecting main line processing.
-4. **Service Discovery**: Stores the node-to-topic mapping in Consul, which sidecars use to dynamically discover which topics they are responsible for consuming.
+4. **Service Discovery**: Stores the node in Consul under `pipestream/node-topics/`, which sidecars use to acquire leases and discover which topics to consume. See [08-kafka-sidecar.md](./08-kafka-sidecar.md) for the dual topic pattern (intake + node topics).
