@@ -1,114 +1,80 @@
 # Kafka Sidecar Pattern
 
-## Overview
+The Kafka Sidecar is a specialized architectural component that bridges the gap between Pipestream's asynchronous messaging layer (Kafka) and its synchronous processing core (Engine). By isolating Kafka consumption in a sidecar, the Engine remains a pure gRPC service, simplified for low-latency processing and independent scaling.
 
-The Kafka Sidecar separates Kafka consumption from engine processing. This keeps the engine as a **pure gRPC service** while enabling async/replay capabilities via Kafka.
+### Sidecar Orchestration
+- **Consumer Lease Management**: Sidecars use Consul-based sessions and KV locks to dynamically acquire and release topic leases, ensuring each Kafka topic is processed by only one sidecar at a time.
+- **Reference Hydration (Level 1)**: Since Kafka messages only contain document references (to stay under 10MB), the Sidecar fetches the full `PipeDoc` metadata from the Repo Service before calling the Engine.
+- **Reliable Handoff**: The Sidecar delivers the hydrated document to the Engine via gRPC and only commits the Kafka offset once the Engine acknowledges successful receipt or persistence.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                     COMPUTE TASK (Fargate/Container)                             │
-│                                                                                  │
-│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐             │
-│  │  Consul Agent   │    │  Kafka Sidecar  │    │     Engine      │             │
-│  │                 │    │                 │    │                 │             │
-│  │  • Health check │◄───│  • Lease mgmt   │    │  • Pure gRPC    │             │
-│  │  • Service reg  │    │  • Consume      │───►│  • Stateless    │             │
-│  │                 │    │  • Hydrate S3   │    │  • Routes/maps  │             │
-│  │                 │    │  • Commit offset│◄───│  • Calls modules│             │
-│  └─────────────────┘    └─────────────────┘    └─────────────────┘             │
-│                                │                       │                        │
-│                                │ localhost:50051       │ gRPC to modules        │
-│                                └───────────────────────┘                        │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
+### Lease Management Implementation
 
-## Why Sidecar?
-
-### The Problem
-
-```
-Without sidecar:
-- 1000s of topics (one per node)
-- Each engine joins every consumer group
-- 100 engines × 1000 topics = 100,000 consumer group memberships
-- Rebalancing nightmare
-- Complex lease management inside engine
-```
-
-### The Solution
-
-```
-With sidecar:
-- Engine is pure gRPC (doesn't know Kafka exists)
-- Sidecar handles all Kafka complexity
-- Consul leases distribute topics across sidecars
-- Clean separation of concerns
-- Scale independently
-```
-
-## Component Responsibilities
-
-| Component | Responsibility | Kafka Aware? |
-|-----------|----------------|---------------|
-| **Kafka Sidecar** | Lease, consume, hydrate, deliver, commit | Yes |
-| **Engine** | Filter, map, call modules, route | No |
-| **Modules** | Transform PipeDoc | No |
-| **Consul** | Health checks, lease management | N/A |
-
-## Sidecar Responsibilities
-
-### 1. Consul Lease Management
+The sidecar uses a "lock-per-topic" strategy in Consul to distribute the workload across the cluster without complex consumer group rebalancing.
 
 ```java
-public class TopicLeaseManager {
-    private final ConsulClient consul;
-    private final String sessionId;
-    private final Set<String> leasedTopics = new ConcurrentHashSet<>();
+public void acquireLeases() {
+    // 1. Get all topics registered for this cluster
+    List<String> topics = consul.getKVKeys("pipestream/topics/");
     
-    public void start() {
-        // Create session linked to health check
-        sessionId = consul.createSession(Session.builder()
-            .name("kafka-sidecar-" + instanceId)
-            .ttl("30s")
-            .behavior("delete")  // Release leases on session death
-            .checks(List.of(healthCheckId))
-            .build());
+    for (String topicKey : topics) {
+        if (leasedTopics.size() >= MAX_LEASES) break;
         
-        // Watch for available topics
-        consul.watch("pipestream/topics/", this::onTopicsChanged);
-    }
-    
-    void onTopicsChanged(List<String> availableTopics) {
-        for (String topicId : availableTopics) {
-            if (leasedTopics.size() < MAX_TOPICS_PER_SIDECAR) {
-                tryAcquireLease(topicId);
-            }
-        }
-    }
-    
-    void tryAcquireLease(String topicId) {
-        boolean acquired = consul.kvAcquire(
-            "pipestream/topics/" + topicId,
-            sessionId
-        );
+        // 2. Try to acquire ephemeral lock linked to sidecar session
+        boolean acquired = consul.acquireLock(topicKey, sessionId);
         
         if (acquired) {
-            leasedTopics.add(topicId);
-            kafkaConsumer.subscribe(topicId);
+            // 3. Start Kafka consumer for this specific topic
+            startConsumer(topicKey);
+            leasedTopics.add(topicKey);
         }
     }
-    
-    // On session invalidation (health check fail, crash):
-    // Consul automatically releases all leases
-    // Other sidecars can acquire them
 }
 ```
 
-### 2. Kafka Consumption
+### Deep Dive: Why a Sidecar?
 
-```java
-public class KafkaConsumerLoop {
+Traditional "all-in-one" consumers struggle in large-scale multi-tenant environments:
+
+- **Consumer Group Rebalancing**: With thousands of topics, standard Kafka rebalancing becomes a "stop-the-world" bottleneck. Sidecars avoid this by treating each topic as an independent lease.
+- **Stateless Engine**: The Engine doesn't need to know about Kafka brokers, offsets, or partitions. It simply processes gRPC requests, making it easier to test and deploy.
+- **Resource Isolation**: Memory-intensive hydration and Kafka buffering happen in the Sidecar, protecting the Engine's CPU cycles for mapping and module execution.
+- **Local Handoff**: Sidecars typically run in the same pod or compute task as the Engine, using `localhost` for gRPC communication to minimize latency.
+
+### Compute Task Visualization
+
+```mermaid
+graph LR
+    subgraph ComputeTask [Compute Task Pod/Container]
+        Sidecar["Kafka Sidecar<br/>• Lease Mgmt<br/>• Consume<br/>• Hydrate"]
+        Engine["Engine<br/>• Stateless<br/>• Mapping<br/>• Routing"]
+        Consul["Consul Agent"]
+        
+        Sidecar -- "gRPC (Hydrated Doc)" --> Engine
+        Engine -- "Ack/Commit" --> Sidecar
+        Sidecar --- Consul
+    end
+    
+    Kafka[[Kafka]] --> Sidecar
+    Engine -- "gRPC Call" --> Module[Remote Module]
+```
+
+### Consumption and Hydration Sequence
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka
+    participant S as Sidecar
+    participant R as Repo Service
+    participant E as Engine
+    
+    K->>S: Consume Message (DocumentRef)
+    S->>R: getPipeDoc(Ref)
+    R-->>S: return PipeDoc
+    S->>E: processNode(PipeStream + PipeDoc)
+    Note over E: Execute Logic
+    E-->>S: 200 OK
+    S->>K: Commit Offset
+```
     
     void consumeLoop() {
         while (running) {

@@ -1,105 +1,19 @@
 # Hydration Model
 
-## Overview
+The Hydration Model defines how the PipeStream engine retrieves document content and metadata from persistent storage. By separating the document reference from its physical content, the engine can efficiently route large documents across the network while only fetching the binary data when strictly required by a processing module.
 
-Hydration is the process of fetching document data from storage when only a reference is available. PipeStream has **two independent levels** of hydration.
+### Hydration Levels
+- **Level 1: Document Hydration**: Resolves a `DocumentReference` into a full `PipeDoc` metadata object. This is typically done by the Kafka Sidecar or the Engine when a gRPC sender provides only a reference.
+- **Level 2: Blob Hydration**: Fetches the raw binary content (bytes) from S3 via the Repo Service. This is an on-demand process triggered only if the target module (like a parser) requires the raw file for processing.
+- **Dehydration**: The inverse process where a full document is replaced by a reference after persistence, ensuring Kafka message size limits (10MB) are respected.
 
-## Two-Level Hydration
+### Engine Hydration Implementation
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    HYDRATION LEVELS                                  │
-│                                                                      │
-│  Level 1: PipeStream → PipeDoc                                      │
-│  ─────────────────────────────────                                  │
-│  Question: Do I have the document?                                  │
-│                                                                      │
-│  PipeStream contains:                                               │
-│  ├── OPTION A: PipeDoc document (inline)                            │
-│  └── OPTION B: DocumentReference document_ref (stored in repo)      │
-│                                                                      │
-│  If document_ref → call Repo.GetPipeDoc() to hydrate                │
-│                                                                      │
-│  ───────────────────────────────────────────────────────────────    │
-│                                                                      │
-│  Level 2: PipeDoc → Blob Content                                    │
-│  ────────────────────────────────                                   │
-│  Question: Do I need the binary content?                            │
-│                                                                      │
-│  PipeDoc.blob_bag.blob contains:                                    │
-│  ├── OPTION A: bytes data (inline)                                  │
-│  ├── OPTION B: FileStorageReference storage_ref (in S3)             │
-│  └── OPTION C: Empty/dropped (binary no longer needed)              │
-│                                                                      │
-│  If storage_ref AND module needs blob → hydrate from Repo           │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-## DocumentReference (Level 1)
-
-```protobuf
-// Reference to a PipeDoc stored in the repository.
-message DocumentReference {
-  // Document identifier.
-  string doc_id = 1;
-  // Node that produced this version (determines storage location).
-  string source_node_id = 2;
-  // Account context for multi-tenant lookup.
-  string account_id = 3;
-}
-```
-
-**S3 Storage Structure:**
-```
-s3://bucket/{node-uuid}/
-  ├── {doc-id-1}.pipedoc
-  ├── {doc-id-2}.pipedoc
-  └── ... millions of docs ...
-```
-
-Each node instance has its own directory. Millions of documents flow through each node.
-
-## Transport Constraints
-
-| Transport | Document Storage | Reason |
-|-----------|------------------|--------|
-| **Kafka** | Always `document_ref` | 10MB message limit |
-| **gRPC** | Either inline or `document_ref` | 2GB limit allows flexibility |
-
-## Blob Hydration Decision (Level 2)
-
-| Module Type | Needs Blob? | Action |
-|-------------|-------------|--------|
-| **Parser** (Tika, Docling) | Yes | Hydrate `storage_ref` → `bytes data` |
-| **Chunker** | No | Skip hydration |
-| **Embedder** | No | Skip hydration |
-| **Enricher** | Usually no | Skip unless config says otherwise |
-| **Sink** | Depends | Config-driven |
-
-## Blob Lifecycle After Parsing
-
-```
-Document enters pipeline:
-  └── blob_bag.blob.data = [original Word doc bytes]
-
-After parser (Tika) processes:
-  └── parsed_metadata populated
-  └── blob_bag options:
-      ├── KEEP INLINE: blob.data still present (for parser→parser)
-      ├── DEHYDRATE: blob.storage_ref points to S3, data cleared
-      └── DROP: blob_bag empty (binary no longer needed)
-
-Rest of pipeline (chunker, embedder, sink):
-  └── Works with parsed_metadata, search_metadata
-  └── No need for original binary
-```
-
-## Engine Hydration Logic
+The engine handles hydration within its processing loop, checking the requirements of the module before execution.
 
 ```java
 void processNode(PipeStream stream) {
-    // Level 1: Hydrate PipeStream → PipeDoc
+    // 1. Level 1 Hydration: Reference -> Metadata
     PipeDoc doc;
     if (stream.hasDocumentRef()) {
         DocumentReference ref = stream.getDocumentRef();
@@ -108,13 +22,15 @@ void processNode(PipeStream stream) {
         doc = stream.getDocument();
     }
     
-    // Level 2: Hydrate Blob if module needs it
+    // 2. Level 2 Hydration: Reference -> Binary Bytes
     GraphNode node = graphCache.getNode(stream.getCurrentNodeId());
     ModuleCapabilities caps = getModuleCapabilities(node.getModuleId());
     
     if (caps.needsBlobContent() && doc.getBlobBag().getBlob().hasStorageRef()) {
         FileStorageReference ref = doc.getBlobBag().getBlob().getStorageRef();
         byte[] blobData = repoService.getBlob(ref);
+        
+        // Inline the bytes for the module
         doc = doc.toBuilder()
             .setBlobBag(doc.getBlobBag().toBuilder()
                 .setBlob(doc.getBlobBag().getBlob().toBuilder()
@@ -125,72 +41,80 @@ void processNode(PipeStream stream) {
             .build();
     }
     
-    // Now call module with appropriately hydrated doc
+    // Call module with hydrated document
     ProcessDataResponse response = callModule(node, doc);
-    // ...
 }
 ```
 
-## Dehydration (After Module Processing)
+### Deep Dive: Hydration Decisions
+
+The hydration strategy is optimized for the "Fast Path" where documents move via gRPC.
+
+- **Selective Fetching**: Level 2 hydration is only performed if `needsBlobContent()` is true. Parsers (Tika, Docling) need blobs; Chunkers and Embedders do not.
+- **Sidecar Responsibility**: When documents arrive via Kafka, the Sidecar performs Level 1 hydration before the Engine ever sees the request, keeping the Engine's gRPC interface consistent.
+- **Repo Service Abstraction**: Neither the Engine nor the Sidecar access S3 directly. They use the Repo Service gRPC API, which manages authentication, path resolution, and caching.
+- **Storage Structure**: Documents are stored in S3 using a hierarchical path `{accountId}/{nodeId}/{docId}.pipedoc`, allowing for efficient multi-tenant isolation and cleanup.
+
+### Visualization of Hydration Flow
+
+```mermaid
+graph TD
+    subgraph KafkaPath [Kafka Sidecar Level 1]
+        KS1[Receive Kafka Ref] --> KS2[Call Repo: getPipeDoc]
+        KS2 --> KS3[Hydrated Metadata]
+    end
+    
+    subgraph EnginePath [Engine Level 2]
+        KS3 --> E1[Receive gRPC]
+        E1 --> E2{Module needs blob?}
+        E2 -- Yes --> E3[Call Repo: getBlob]
+        E3 --> E4[Inlined Bytes]
+        E2 -- No --> E5[Metadata Only]
+    end
+    
+    E4 --> Module[Remote Module]
+    E5 --> Module
+    
+    Repo[(Repo Service)]
+    S3[(S3 Storage)]
+    
+    KS2 -.-> Repo
+    E3 -.-> Repo
+    Repo --- S3
+```
+
+### Dehydration Flow (Post-Processing)
+
+After a module completes its work, the engine may dehydrate the document before routing it to the next node, especially if the next hop is via Kafka.
 
 ```java
 void routeToNextNode(PipeStream stream, PipeDoc doc, GraphEdge edge) {
     if (edge.getTransportType() == TRANSPORT_TYPE_MESSAGING) {
-        // Kafka edge: MUST persist, use document_ref
-        String nodeId = stream.getCurrentNodeId();
-        repoService.savePipeDoc(doc, nodeId, stream.getAccountId());
+        // MUST persist and dehydrate for Kafka
+        repoService.savePipeDoc(doc, stream.getCurrentNodeId(), stream.getAccountId());
         
         PipeStream dehydrated = stream.toBuilder()
             .clearDocument()
             .setDocumentRef(DocumentReference.newBuilder()
                 .setDocId(doc.getDocId())
-                .setSourceNodeId(nodeId)
+                .setSourceNodeId(stream.getCurrentNodeId())
                 .setAccountId(stream.getAccountId())
                 .build())
             .build();
-        
+            
         kafkaProducer.send(edge.getKafkaTopic(), dehydrated);
-        
-    } else {
-        // gRPC edge: can pass inline (or dehydrate for large docs)
-        if (shouldDehydrate(doc)) {
-            // Same as above
-        } else {
-            // Pass inline
-            engineClient.processNode(stream.toBuilder()
-                .setDocument(doc)
-                .build());
-        }
     }
 }
 ```
 
-## No-Persistence Fast Path
-
-A document can flow through the entire pipeline without ever touching S3:
-
+```mermaid
+sequenceDiagram
+    participant E as Engine
+    participant R as Repo Service
+    participant K as Kafka
+    
+    E->>R: savePipeDoc(full_doc)
+    R-->>E: Ack
+    E->>E: Clear doc field, Set doc_ref
+    E->>K: publish(dehydrated_stream)
 ```
-Intake ──gRPC──► Engine ──gRPC──► Parser ──gRPC──► Engine ──gRPC──► Chunker ...
-                   │                                  │
-                   └── inline doc ────────────────────┘
-                       (never persisted until sink)
-```
-
-This is the fast path for:
-- Small documents
-- All gRPC edges
-- Latency-sensitive processing
-
-## Multi-Parser Scenario
-
-```
-Tika (parser) ──► Docling (parser)
-
-Between parsers:
-  └── blob.data kept INLINE (Docling needs the binary)
-
-After Docling:
-  └── blob dehydrated or dropped (no more parsers need it)
-```
-
-The engine tracks whether downstream nodes need the blob and makes the hydration/dehydration decision accordingly.

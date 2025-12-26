@@ -1,146 +1,95 @@
 # Dead Letter Queue (DLQ) Handling
 
-## Overview
+The Dead Letter Queue (DLQ) is a critical resiliency mechanism that captures documents failing to process due to infrastructure or transient errors. By isolating these "poison messages" in dedicated Kafka topics, Pipestream ensures that pipeline execution continues for healthy documents while providing operators with the tools to investigate and replay failures.
 
-DLQs capture messages that can't be processed successfully. They prevent poison messages from blocking the pipeline while preserving them for investigation and replay.
+### DLQ Workflow
+- **Failure Identification**: The Engine distinguishes between logical failures (where a module returns `success=false`) and infrastructure failures (like gRPC timeouts or module unavailability). Only infrastructure failures trigger the DLQ process.
+- **Retry Strategy**: Before a document is sent to the DLQ, the Engine applies a configurable retry policy (e.g., 3 attempts with exponential backoff) to resolve transient network issues.
+- **DLQ Persistence**: Exhausted failures are wrapped in a `DlqMessage`—containing the original `PipeStream` and detailed error context—and published to a node-specific DLQ topic (e.g., `dlq.prod.node-uuid`).
 
-## DLQ Structure
+### Retry and DLQ Implementation
 
-One DLQ topic per node:
-
-```
-dlq.{cluster_id}.{node-uuid}
-```
-
-## What Triggers DLQ
-
-| Scenario | DLQ? | Reason |
-|----------|------|--------|
-| Module returns `success=false` | ❌ No | Logical failure - continue with error logged |
-| Module unreachable (Consul down) | ✅ Yes | Infrastructure failure |
-| gRPC timeout | ✅ Yes | After retries exhausted |
-| gRPC connection refused | ✅ Yes | Module crashed/unavailable |
-| Repeated transient failures | ✅ Yes | After retry threshold |
-| Invalid PipeStream (malformed) | ✅ Yes | Can't process |
-| Max hops exceeded | ✅ Yes | Loop prevention |
-
-## DLQ Message Format
-
-```protobuf
-message DlqMessage {
-  // The failed stream (with document_ref to repo)
-  PipeStream stream = 1;
-  
-  // Error details
-  string error_type = 2;           // "MODULE_UNAVAILABLE", "TIMEOUT", etc.
-  string error_message = 3;
-  google.protobuf.Timestamp failed_at = 4;
-  
-  // Retry context
-  int32 retry_count = 5;
-  string failed_node_id = 6;
-  string original_topic = 7;
-  int64 original_offset = 8;
-}
-```
-
-## DLQ Configuration
-
-```protobuf
-message DlqConfig {
-  bool enabled = 1;                          // default: true
-  optional string topic = 2;                 // override default naming
-  int32 max_retries = 3;                     // default: 3
-  google.protobuf.Duration retry_backoff = 4;
-}
-```
-
-Configured per node in `GraphNode.dlq_config`.
-
-## Engine DLQ Logic
+The Engine's processing loop wraps module calls in a retry handler to manage infrastructure instability.
 
 ```java
 void processWithRetry(PipeStream stream, GraphNode node) {
     DlqConfig dlqConfig = node.getDlqConfig();
-    int maxRetries = dlqConfig.getMaxRetries();
-    Duration backoff = dlqConfig.getRetryBackoff();
-    
     int attempt = 0;
-    Exception lastError = null;
     
-    while (attempt < maxRetries) {
+    while (attempt < dlqConfig.getMaxRetries()) {
         try {
-            processNode(stream);
-            return;  // Success
+            processNode(stream); // Primary execution
+            return; 
         } catch (ModuleUnavailableException | TimeoutException e) {
-            lastError = e;
             attempt++;
-            
-            if (attempt < maxRetries) {
-                Thread.sleep(backoff.toMillis() * attempt);  // Linear backoff
+            if (attempt < dlqConfig.getMaxRetries()) {
+                waitForBackoff(attempt, dlqConfig.getRetryBackoff());
+            } else {
+                sendToDlq(stream, node, e, attempt);
             }
         }
     }
-    
-    // All retries exhausted - send to DLQ
-    sendToDlq(stream, node, lastError, attempt);
 }
 ```
 
-## Logical Failures (Not DLQ)
+### Deep Dive: DLQ Strategy
 
-When a module returns `success=false`, it's a **logical** failure (e.g., "couldn't parse this PDF"). This is NOT a DLQ case:
+Pipestream's DLQ design prioritizes system availability and auditability:
 
-```java
-ProcessDataResponse response = module.processData(request);
+- **Logical Failures vs. DLQ**: If a module returns `success=false` (e.g., "invalid PDF format"), this is considered a successful execution of the *step*. The error is logged in the document history, and the pipeline continues to the next node.
+- **Node-Specific Topics**: Every node in the graph has its own DLQ topic, allowing operators to pinpoint exactly which stage of the pipeline is failing.
+- **Preservation of Context**: `DlqMessage` includes the original Kafka topic and offset, allowing for precise correlation with broker logs during troubleshooting.
+- **Replayability**: Documents in the DLQ can be "replayed" by republishing them to the node's main input topic once the underlying issue (e.g., a module crash) is resolved.
 
-if (!response.getSuccess()) {
-    // Log error in stream history
-    stream = appendErrorToHistory(stream, response.getErrorMessage());
+### Failure Handling Visualization
+
+```mermaid
+flowchart TD
+    Start[Receive Document] --> Call[Call Module gRPC]
+    Call -- Success --> Next[Route to Next Node]
     
-    // Continue to next nodes (with original doc)
-    routeToNextNodes(stream, request.getDocument());
+    Call -- "Logical Fail (success=false)" --> Log[Log Error in History]
+    Log --> Next
+    
+    Call -- "Infra Fail (Timeout/503)" --> Retry{Retry Count < 3?}
+    Retry -- Yes --> Wait[Backoff Wait]
+    Wait --> Call
+    
+    Retry -- No --> DLQ[Publish to DLQ Topic]
+    DLQ --> End([Stop Processing])
+```
+
+### DLQ Message Schema (Protobuf)
+
+The `DlqMessage` acts as a container for both the failed data and the metadata required for diagnostics.
+
+```protobuf
+message DlqMessage {
+  // The failed stream (with document_ref to repo)
+  optional PipeStream stream = 1;
+  
+  // Diagnostic details
+  optional string error_type = 2;           // "TIMEOUT", "CONNECTION_REFUSED"
+  optional string error_message = 3;
+  optional google.protobuf.Timestamp failed_at = 4;
+  
+  // Origin context for replay
+  optional string failed_node_id = 6;
+  optional string original_topic = 7;
 }
 ```
 
-## DLQ Replay
+### Replay Sequence
 
-### V1: Manual
-
-```bash
-# Admin republishes DLQ messages
-kafka-console-consumer --topic dlq.prod.{node-uuid} \
-  | kafka-console-producer --topic prod.{node-uuid}
-```
-
-### V2: Admin API
-
-```java
-@POST("/admin/dlq/{nodeId}/replay")
-public void replayDlq(String nodeId, ReplayRequest request) {
-    String dlqTopic = "dlq." + clusterId + "." + nodeId;
-    String targetTopic = graphCache.getNode(nodeId).getKafkaInputTopic();
+```mermaid
+sequenceDiagram
+    participant A as Admin API
+    participant D as DLQ Topic
+    participant I as Main Input Topic
+    participant E as Engine
     
-    consumer.subscribe(dlqTopic);
-    while (hasMore(request)) {
-        DlqMessage msg = consumer.poll();
-        kafkaProducer.send(targetTopic, msg.getStream());
-    }
-}
-```
-
-## Monitoring
-
-```yaml
-- alert: DLQDepthHigh
-  expr: pipestream_dlq_depth > 100
-  for: 5m
-  annotations:
-    summary: "DLQ depth high for {{ $labels.node_id }}"
-    
-- alert: DLQGrowing
-  expr: rate(pipestream_dlq_messages_total[5m]) > 1
-  for: 10m
-  annotations:
-    summary: "DLQ growing for {{ $labels.node_id }}"
+    A->>D: Consume failed message
+    D-->>A: DlqMessage(Stream)
+    A->>I: Publish original Stream
+    I->>E: Process Node (Retry)
 ```
