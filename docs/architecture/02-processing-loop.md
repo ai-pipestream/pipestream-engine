@@ -8,9 +8,10 @@ The core loop orchestrates the execution of a single pipeline node. It fetches t
 
 ### Processing Steps
 - **Node Configuration Lookup**: Retrieves the specific settings for the current node from the in-memory graph cache.
-- **Document Hydration**: Ensures the full document data is available, fetching it from the repository service if only a reference was provided.
+- **Document Hydration (Level 1)**: Ensures the full document data is available, fetching it from the repository service if only a reference was provided.
 - **Filter Evaluation**: Checks a CEL (Common Expression Language) condition to decide if the node's logic should be applied or if the document should bypass this node.
 - **Pre-mapping Transforms**: Applies data transformations to the document before it is sent to the module.
+- **Blob Hydration (Level 2)**: If the module needs blob content (e.g., parsers), fetches the binary data from the repository service.
 - **Module Execution**: Calls the remote module service via gRPC and handles the response.
 - **Post-mapping Transforms**: Applies further transformations to the output document received from the module.
 - **Metadata Update**: Records the execution history and updates stream-level information.
@@ -23,10 +24,18 @@ void processNode(PipeStream stream) {
     // 1. Lookup node config from graph cache
     NodeConfig config = graphCache.getNode(nodeId);
     
-    // 2. Hydrate PipeDoc if reference-only
-    PipeDoc doc = stream.hasDocument() 
-        ? stream.getDocument()
-        : repoService.getPipeDoc(stream.getDocumentRef());
+    // 2. Hydrate PipeDoc if reference-only (Level 1)
+    PipeDoc doc;
+    if (stream.hasDocument()) {
+        doc = stream.getDocument();
+    } else {
+        DocumentReference ref = stream.getDocumentRef();
+        doc = repoService.getPipeDoc(
+            ref.getDocId(), 
+            ref.getSourceNodeId(), 
+            ref.getAccountId()
+        );
+    }
     
     // 3. Filter check (CEL)
     if (config.hasFilterCondition()) {
@@ -41,7 +50,22 @@ void processNode(PipeStream stream) {
     // 4. Apply pre-mappings
     doc = applyMappings(doc, config.getPreMappingsList());
     
-    // 5. Call remote module
+    // 5. Blob hydration if module needs it (Level 2)
+    ModuleCapabilities caps = getModuleCapabilities(config.getModuleId());
+    if (caps.needsBlobContent() && doc.getBlobBag().getBlob().hasStorageRef()) {
+        FileStorageReference blobRef = doc.getBlobBag().getBlob().getStorageRef();
+        byte[] blobData = repoService.getBlob(blobRef);
+        doc = doc.toBuilder()
+            .setBlobBag(doc.getBlobBag().toBuilder()
+                .setBlob(doc.getBlobBag().getBlob().toBuilder()
+                    .setData(ByteString.copyFrom(blobData))
+                    .clearStorageRef()
+                    .build())
+                .build())
+            .build();
+    }
+    
+    // 6. Call remote module
     ProcessDataResponse response = callModule(nodeId, doc, config);
     
     if (!response.getSuccess()) {
@@ -51,13 +75,13 @@ void processNode(PipeStream stream) {
     
     PipeDoc outputDoc = response.getOutputDoc();
     
-    // 6. Apply post-mappings
+    // 7. Apply post-mappings
     outputDoc = applyMappings(outputDoc, config.getPostMappingsList());
     
-    // 7. Update stream metadata
+    // 8. Update stream metadata
     stream = updateStreamMetadata(stream, outputDoc, nodeId);
     
-    // 8. Route to next nodes
+    // 9. Route to next nodes
     routeToNextNodes(stream, outputDoc);
 }
 ```
@@ -65,13 +89,16 @@ void processNode(PipeStream stream) {
 ```mermaid
 flowchart TD
     Start([Start processNode]) --> Config[Lookup Node Config]
-    Config --> Hydrate{Hydrate Doc?}
-    Hydrate -- Ref only --> Fetch[Fetch from Repo Service]
-    Hydrate -- Inline --> Filter{Filter CEL?}
+    Config --> Hydrate1{Has Document?}
+    Hydrate1 -- Ref only --> Fetch[Fetch from Repo Service]
+    Hydrate1 -- Inline --> Filter{Filter CEL?}
     Fetch --> Filter
     Filter -- Match --> PreMap[Apply Pre-mappings]
     Filter -- No Match --> Route[Route to Next Nodes]
-    PreMap --> Call[Call Remote Module]
+    PreMap --> Hydrate2{Module needs blob?}
+    Hydrate2 -- Yes --> FetchBlob[Fetch Blob from Repo]
+    Hydrate2 -- No --> Call
+    FetchBlob --> Call[Call Remote Module]
     Call --> Success{Success?}
     Success -- No --> Error[Append Error to History]
     Success -- Yes --> PostMap[Apply Post-mappings]
@@ -136,7 +163,7 @@ Routing manages the "fan-out" logic of the pipeline. It determines which edges t
 - **Condition Evaluation**: Uses CEL to determine which edges the document qualifies for.
 - **Terminal Handling**: Finalizes the stream if no matching outgoing edges are found.
 - **Transport Selection**:
-    - **Kafka Path**: Offloads large documents to storage (S3) and sends a reference via a Kafka topic.
+    - **Kafka Path**: Persists the document to the repository service and sends a reference via a Kafka topic.
     - **gRPC Path**: Sends the document directly to another engine instance, either in a different cluster or via a local recursive call.
 
 ```java
@@ -172,12 +199,20 @@ void routeToNextNodes(PipeStream stream, PipeDoc doc) {
 }
 
 void routeViaTransport(PipeStream stream, PipeDoc doc, GraphEdge edge) {
+    String currentNodeId = stream.getCurrentNodeId();
+    String accountId = stream.getMetadata().getAccountId();
+    
     if (edge.getTransportType() == TransportType.MESSAGING) {
-        // Kafka path - offload doc to S3
-        String docRef = repoService.savePipeDoc(doc);
+        // Kafka path - persist doc to repo, send reference
+        repoService.savePipeDoc(doc, currentNodeId, accountId);
+        
         PipeStream streamWithRef = stream.toBuilder()
             .clearDocument()
-            .setDocumentRef(docRef)
+            .setDocumentRef(DocumentReference.newBuilder()
+                .setDocId(doc.getDocId())
+                .setSourceNodeId(currentNodeId)
+                .setAccountId(accountId)
+                .build())
             .build();
         
         String topic = edge.hasKafkaTopic() 
@@ -212,8 +247,8 @@ flowchart TD
     None -- No --> Terminal[Handle Terminal Node]
     None -- Yes --> Loop[For Each Matching Edge]
     Loop --> Transport{Transport Type?}
-    Transport -- Messaging/Kafka --> S3[Save to S3/Repo]
-    S3 --> Kafka[Send to Kafka Topic]
+    Transport -- Messaging/Kafka --> Save[Save to Repo Service]
+    Save --> Kafka[Send Ref to Kafka Topic]
     Transport -- gRPC --> Cluster{Cross Cluster?}
     Cluster -- Yes --> Remote[Route to Remote Cluster]
     Cluster -- No --> Local[Local processNode call]
@@ -293,4 +328,5 @@ The engine employs different strategies depending on the nature of the failure t
 | Module unreachable (Consul down) | Route to DLQ |
 | gRPC timeout | Retry with backoff, then DLQ |
 | CEL evaluation error | Log error, skip edge |
-| S3 hydration failure | Retry, then DLQ |
+| Document hydration failure | Retry, then DLQ |
+| Blob hydration failure | Retry, then DLQ |
