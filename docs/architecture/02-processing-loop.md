@@ -281,7 +281,7 @@ The engine communicates with external modules (like parsers or LLMs) via gRPC. T
 
 ### Module Call Steps
 - **Service Discovery**: Queries Consul to find a healthy instance of the required module service.
-- **Availability Check**: Ensures a service instance exists; otherwise, throws an exception for retry/DLQ handling.
+- **Availability Check**: Ensures a service instance exists; otherwise, throws an exception for retry handling.
 - **Request Construction**: Packages the document, node configuration, and stream metadata into a `ProcessDataRequest`.
 - **gRPC Invocation**: Executes the remote call using a blocking stub with a configurable deadline/timeout.
 
@@ -292,7 +292,7 @@ ProcessDataResponse callModule(String nodeId, PipeDoc doc, NodeConfig config) {
     ServiceInstance instance = consul.getHealthyInstance(moduleName);
     
     if (instance == null) {
-        // Module unavailable - DLQ or retry
+        // Module unavailable - throw for retry handling
         throw new ModuleUnavailableException(moduleName);
     }
     
@@ -339,11 +339,18 @@ sequenceDiagram
 
 The engine employs different strategies depending on the nature of the failure to ensure robustness and observability.
 
-| Error Type | Handling |
-|------------|----------|
-| Module returns `success=false` | Log in history, continue to next nodes |
-| Module unreachable (Consul down) | Route to DLQ |
-| gRPC timeout | Retry with backoff, then DLQ |
-| CEL evaluation error | Log error, skip edge |
-| Document hydration failure | Retry, then DLQ |
-| Blob hydration failure | Retry, then DLQ |
+| Error Type | Handling | DLQ Behavior |
+|------------|----------|--------------|
+| Module returns `success=false` | Log in history, continue to next nodes | None (logical failure, not infrastructure) |
+| Module unreachable | Retry with backoff, then return error | Caller handles DLQ (Sidecar or upstream) |
+| gRPC timeout | Retry with backoff, then return error | Caller handles DLQ (Sidecar or upstream) |
+| CEL evaluation error | Log error, skip edge | None |
+| Document hydration failure | Retry, then return error | Caller handles DLQ |
+| Blob hydration failure | Retry, then return error | Caller handles DLQ |
+
+**DLQ Ownership:**
+- **Kafka arrivals (via Sidecar)**: Sidecar publishes to DLQ on Engine error
+- **gRPC arrivals (direct)**: Error bubbles up to caller; replay from last Kafka checkpoint
+- **gRPC with `save_on_error=true`**: Engine persists doc and publishes to DLQ before returning error
+
+See [10-dlq-handling.md](./10-dlq-handling.md) for detailed DLQ patterns.
