@@ -21,10 +21,10 @@ The core loop orchestrates the execution of a single pipeline node. It fetches t
 void processNode(PipeStream stream) {
     String nodeId = stream.getCurrentNodeId();
     
-    // 1. Lookup node config from graph cache
+    // 1. Lookup node config from graph cache (1)
     NodeConfig config = graphCache.getNode(nodeId);
     
-    // 2. Hydrate PipeDoc if reference-only (Level 1)
+    // 2. Hydrate PipeDoc if reference-only (Level 1) (2)
     PipeDoc doc;
     if (stream.hasDocument()) {
         doc = stream.getDocument();
@@ -37,7 +37,7 @@ void processNode(PipeStream stream) {
         );
     }
     
-    // 3. Filter check (CEL)
+    // 3. Filter check (CEL) (3)
     if (config.hasFilterCondition()) {
         boolean shouldProcess = celEvaluate(config.getFilterCondition(), doc);
         if (!shouldProcess) {
@@ -47,10 +47,10 @@ void processNode(PipeStream stream) {
         }
     }
     
-    // 4. Apply pre-mappings
+    // 4. Apply pre-mappings (4)
     doc = applyMappings(doc, config.getPreMappingsList());
     
-    // 5. Blob hydration if module needs it (Level 2)
+    // 5. Blob hydration if module needs it (Level 2) (5)
     ModuleCapabilities caps = getModuleCapabilities(config.getModuleId());
     if (caps.needsBlobContent() && doc.getBlobBag().getBlob().hasStorageRef()) {
         FileStorageReference blobRef = doc.getBlobBag().getBlob().getStorageRef();
@@ -65,7 +65,7 @@ void processNode(PipeStream stream) {
             .build();
     }
     
-    // 6. Call remote module
+    // 6. Call remote module (6)
     ProcessDataResponse response = callModule(nodeId, doc, config);
     
     if (!response.getSuccess()) {
@@ -75,16 +75,27 @@ void processNode(PipeStream stream) {
     
     PipeDoc outputDoc = response.getOutputDoc();
     
-    // 7. Apply post-mappings
+    // 7. Apply post-mappings (7)
     outputDoc = applyMappings(outputDoc, config.getPostMappingsList());
     
-    // 8. Update stream metadata
+    // 8. Update stream metadata (8)
     stream = updateStreamMetadata(stream, outputDoc, nodeId);
     
-    // 9. Route to next nodes
+    // 9. Route to next nodes (9)
     routeToNextNodes(stream, outputDoc);
 }
 ```
+
+#### Code Deep Dive:
+1. **Graph Cache Lookup**: Retrieves the immutable `NodeConfig` for the current step. This contains the module ID, filter conditions, and mappings.
+2. **Level 1 Hydration**: If the incoming `PipeStream` only contains a reference (common in Kafka transport), the Engine fetches the full `PipeDoc` metadata from the Repository Service.
+3. **CEL Filter**: Evaluates whether the document meets the criteria to be processed by this node. If the condition is false, the node is bypassed.
+4. **Pre-Mapping**: Applies field transformations defined in the graph to prepare the document for the module (e.g., renaming fields or extracting sub-objects).
+5. **Level 2 Hydration**: If the module requires the raw file (like a parser), the Engine fetches the actual bytes from storage via the Repository Service.
+6. **Remote Execution**: Invokes the module's gRPC endpoint. This is a stateless call; the module only sees the hydrated `PipeDoc`.
+7. **Post-Mapping**: Transforms the module's output back into the format expected by the rest of the pipeline.
+8. **Metadata Update**: Records the node execution in the `StepExecutionRecord` history and increments the hop count.
+9. **Routing**: Analyzes outgoing edges to determine where the document should go next.
 
 ```mermaid
 flowchart TD
@@ -121,11 +132,11 @@ Metadata updates ensure that every step of the document's journey is tracked and
 ```java
 PipeStream updateStreamMetadata(PipeStream stream, PipeDoc doc, String nodeId) {
     return stream.toBuilder()
-        // Replace document
+        // Replace document (1)
         .setDocument(doc)
-        // Increment hop
+        // Increment hop (2)
         .setHopCount(stream.getHopCount() + 1)
-        // Append to history
+        // Append to history (3)
         .setMetadata(stream.getMetadata().toBuilder()
             .addHistory(StepExecutionRecord.newBuilder()
                 .setNodeId(nodeId)
@@ -135,11 +146,17 @@ PipeStream updateStreamMetadata(PipeStream stream, PipeDoc doc, String nodeId) {
                 .build())
             .setLastProcessedAt(now())
             .build())
-        // Append to path
+        // Append to path (4)
         .addProcessingPath(nodeId)
         .build();
 }
 ```
+
+#### Code Deep Dive:
+1. **Document Swap**: Replaces the `PipeDoc` within the stream with the output from the current node.
+2. **Hop Counting**: Increments the total number of processing steps the document has completed.
+3. **Execution History**: Appends a detailed record of this node's execution, including timing and status, for auditing and debugging.
+4. **Path Tracking**: Adds the current node ID to a flat list of visited nodes, providing a quick view of the document's journey.
 
 ```mermaid
 graph LR

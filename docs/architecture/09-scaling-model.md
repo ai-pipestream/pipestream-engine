@@ -20,19 +20,27 @@ metadata:
 spec:
   scaleTargetRef:
     name: embedder
-  minReplicaCount: 0              # Zero cost when idle
+  // 1. Scale-to-zero (1)
+  minReplicaCount: 0              
   maxReplicaCount: 10
-  cooldownPeriod: 300             # 5 min before scale down
+  cooldownPeriod: 300             
   triggers:
-    - type: prometheus            # Scale based on gRPC throughput
+    // 2. Throughput-based scaling (2)
+    - type: prometheus            
       metadata:
         query: sum(rate(grpc_server_started_total{service="embedder"}[1m]))
         threshold: "10"
-    - type: kafka                 # OR scale based on Kafka lag
+    // 3. Backlog-based scaling (3)
+    - type: kafka                 
       metadata:
         topic: prod.embedder
         lagThreshold: "5"
 ```
+
+#### Code Deep Dive:
+1. **Cost Optimization**: Setting `minReplicaCount: 0` ensures that expensive resources (like GPU nodes) are completely released when no documents are waiting to be processed.
+2. **Predictive Scaling**: By monitoring the rate of gRPC requests (via Prometheus), KEDA can scale up the module instances as soon as traffic begins to flow from the Engines.
+3. **Reactive Scaling**: Monitoring Kafka consumer lag provides a safety net. If documents are piling up in the messaging layer faster than they can be processed, KEDA will spawn additional instances to clear the backlog.
 
 ### Deep Dive: Workload Optimization
 

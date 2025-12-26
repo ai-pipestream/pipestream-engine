@@ -79,11 +79,11 @@ The Engine manages a pool of gRPC clients and handles service discovery and requ
 
 ```java
 ProcessDataResponse callModule(GraphNode node, PipeDoc doc) {
-    // 1. Discover healthy instance via Consul
+    // 1. Service Discovery (1)
     String moduleId = node.getModuleId();
     ServiceInstance instance = moduleDiscovery.getHealthyInstance(moduleId);
     
-    // 2. Prepare request with module-specific config
+    // 2. Request Preparation (2)
     ProcessDataRequest request = ProcessDataRequest.newBuilder()
         .setDocument(doc)
         .setConfig(ProcessConfiguration.newBuilder()
@@ -93,10 +93,15 @@ ProcessDataResponse callModule(GraphNode node, PipeDoc doc) {
         .setMetadata(buildServiceMetadata(stream))
         .build();
     
-    // 3. Execute gRPC call with timeout/retry logic
+    // 3. Remote gRPC Call (3)
     return moduleClientPool.get(instance).processData(request);
 }
 ```
+
+#### Code Deep Dive:
+1. **Consul Lookup**: Resolves a logical module ID (e.g., "tika-parser") to a specific IP and port of a healthy instance. This enables dynamic scaling and high availability.
+2. **Configuration Inlining**: Merges the document with node-specific settings defined in the graph. The module receives everything it needs in a single object.
+3. **Execution**: Uses a pooled gRPC client to invoke the module. The call is synchronous from the perspective of this thread, but the Engine's orchestration layer handles timeouts and retries.
 
 ## Module Responsibilities
 

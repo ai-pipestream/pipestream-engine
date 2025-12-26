@@ -98,26 +98,34 @@ The `GraphEdge` defines the connection between two nodes, including the conditio
 
 ```protobuf
 message GraphEdge {
+  // 1. Unique identifiers (1)
   optional string edge_id = 1;
   optional string from_node_id = 2;
   optional string to_node_id = 3;
   
-  // Cross-cluster routing
+  // 2. Cross-cluster routing (2)
   optional string to_cluster_id = 4;
   optional bool is_cross_cluster = 5;
   
-  // Routing logic (CEL)
+  // 3. Routing logic (3)
   optional string condition = 6;
   optional int32 priority = 7;
   
-  // Transport selection
+  // 4. Transport selection (4)
   optional TransportType transport_type = 8;    // GRPC or MESSAGING
   optional string kafka_topic = 9;              // Override default if Kafka
   
-  // Loop prevention
+  // 5. Loop prevention (5)
   optional int32 max_hops = 10;
 }
 ```
+
+#### Code Deep Dive:
+1. **Connectivity**: Defines the logical link between two nodes in the directed acyclic graph (DAG).
+2. **Cluster Boundaries**: Allows the engine to route documents between different geographic or logical clusters. If `is_cross_cluster` is true, Kafka is the mandatory transport.
+3. **Conditional Flow**: The `condition` field holds a CEL expression that determines if this edge should be traversed. `priority` resolves the order when multiple edges match (fan-out).
+4. **Physical Handoff**: Explicitly defines the transport mechanism. `MESSAGING` defaults to Kafka topics automatically generated for the destination node.
+5. **Circuit Breaking**: The `max_hops` field prevents infinite loops in complex graph configurations.
 
 ## gRPC Transport (Fast Path)
 
@@ -178,30 +186,39 @@ Routing decisions are powered by the Common Expression Language (CEL), allowing 
 
 ```java
 List<GraphEdge> resolveMatchingEdges(String nodeId, PipeDoc doc) {
+    // 1. Fetch possible paths (1)
     List<GraphEdge> edges = graphCache.getOutgoingEdges(nodeId);
     
-    // Sort by priority (lower = higher priority)
+    // 2. Sort by priority (2)
     edges.sort(Comparator.comparingInt(GraphEdge::getPriority));
     
     List<GraphEdge> matching = new ArrayList<>();
     
     for (GraphEdge edge : edges) {
-        // 1. Empty condition = always match
+        // 3. Evaluation: Condition vs Always-Match (3)
         if (!edge.hasCondition()) {
             matching.add(edge);
             continue;
         }
         
-        // 2. Evaluate pre-compiled CEL condition (keyed with "edge:" prefix)
+        // 4. Pre-compiled CEL evaluation (4)
         CelProgram program = graphCache.getCompiledCondition("edge:" + edge.getEdgeId());
         if (celEvaluator.evaluate(program, doc)) {
             matching.add(edge);
         }
     }
     
-    return matching;  // Fan-out to ALL matching edges
+    // 5. Fan-out return (5)
+    return matching; 
 }
 ```
+
+#### Code Deep Dive:
+1. **Edge Retrieval**: Fetches all outgoing connections for the current node from the in-memory cache.
+2. **Deterministic Order**: Sorting by priority ensures that routing decisions are predictable and that higher-priority paths are evaluated first.
+3. **Fallback Logic**: Edges without conditions are treated as "always match," which is useful for default routing or audit logs.
+4. **Performance Optimization**: Instead of parsing the condition string for every document, the engine uses the `CelProgram` pre-compiled during the graph rebuild.
+5. **Multi-Path Routing**: If multiple edges match, the document is effectively duplicated and sent down all qualifying paths, enabling complex parallel workflows.
 
 ```mermaid
 flowchart TD
@@ -229,17 +246,24 @@ The routing system integrates directly with Kafka and Consul to manage the under
 ```java
 void onNodeCreated(GraphNode node) {
     if (hasIncomingKafkaEdges(node)) {
+        // 1. Topic name generation (1)
         String topicName = "pipestream." + node.getClusterId() + "." + node.getNodeId();
         
-        // 1. Create main processing topic
+        // 2. Main processing topic (2)
         kafkaAdmin.createTopic(topicName, partitions, replicationFactor);
         
-        // 2. Create Dead Letter Queue
+        // 3. Resiliency setup (3)
         String dlqTopic = "dlq." + node.getClusterId() + "." + node.getNodeId();
         kafkaAdmin.createTopic(dlqTopic, partitions, replicationFactor);
         
-        // 3. Register in Consul for sidecar lease distribution
+        // 4. Registration phase (4)
         consul.kvPut("pipestream/topics/" + node.getNodeId(), topicName);
     }
 }
 ```
+
+#### Code Deep Dive:
+1. **Naming Convention**: Uses a deterministic pattern including the cluster and node ID to ensure topic uniqueness across global deployments.
+2. **Infrastructure Provisioning**: Dynamically creates the Kafka topic if the graph defines that this node receives data via messaging.
+3. **Dead Letter Queue**: Automatically provisions a corresponding DLQ topic to ensure that poison messages can be isolated without affecting main line processing.
+4. **Service Discovery**: Stores the node-to-topic mapping in Consul, which sidecars use to dynamically discover which topics they are responsible for consuming.

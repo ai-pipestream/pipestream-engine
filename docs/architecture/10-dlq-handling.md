@@ -18,19 +18,29 @@ void processWithRetry(PipeStream stream, GraphNode node) {
     
     while (attempt < dlqConfig.getMaxRetries()) {
         try {
-            processNode(stream); // Primary execution
+            // 1. Core execution (1)
+            processNode(stream); 
             return; 
         } catch (ModuleUnavailableException | TimeoutException e) {
+            // 2. Transient failure handling (2)
             attempt++;
             if (attempt < dlqConfig.getMaxRetries()) {
+                // 3. Backoff wait (3)
                 waitForBackoff(attempt, dlqConfig.getRetryBackoff());
             } else {
+                // 4. DLQ handoff (4)
                 sendToDlq(stream, node, e, attempt);
             }
         }
     }
 }
 ```
+
+#### Code Deep Dive:
+1. **Orchestration**: The standard processing loop is executed. This includes filtering, hydration, and module invocation.
+2. **Infrastructure Exceptions**: The retry logic only triggers for connectivity or timeout issues. Logical failures (where the module returns an error status) do not trigger retries.
+3. **Wait Cycle**: Uses an exponential backoff strategy to prevent "thundering herd" issues when a remote module is restarting.
+4. **Final Failure**: If all retries are exhausted, the document is wrapped in a `DlqMessage` and published to a specialized Kafka topic for operator intervention.
 
 ### Deep Dive: DLQ Strategy
 

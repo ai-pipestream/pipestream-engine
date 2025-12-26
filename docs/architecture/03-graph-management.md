@@ -66,23 +66,23 @@ To minimize latency during document processing, Engines maintain a highly optimi
 ### Cache Implementation
 ```java
 public class GraphCache {
-    // Full graph proto
+    // 1. Immutable graph state (1)
     private volatile PipelineGraph graph;
     private volatile long version;
     
-    // Helper indexes for fast lookups
+    // 2. Optimized lookup indexes (2)
     private Map<String, GraphNode> nodeById;
     private Map<String, List<GraphEdge>> outgoingEdgesByNode;
     private Map<String, CelProgram> compiledConditions;
     
     public void rebuild(PipelineGraph newGraph) {
-        // 1. Build Node Index
+        // 3. Indexing phase (3)
         Map<String, GraphNode> newNodeById = new HashMap<>();
         for (GraphNode node : newGraph.getNodesList()) {
             newNodeById.put(node.getNodeId(), node);
         }
         
-        // 2. Build Adjacency List (Edges)
+        // 4. Adjacency calculation (4)
         Map<String, List<GraphEdge>> newEdgesByNode = new HashMap<>();
         for (GraphEdge edge : newGraph.getEdgesList()) {
             newEdgesByNode
@@ -90,7 +90,7 @@ public class GraphCache {
                 .add(edge);
         }
         
-        // 3. Pre-compile CEL expressions (edges + node filters)
+        // 5. Pre-compilation phase (5)
         Map<String, CelProgram> newConditions = new HashMap<>();
         for (GraphEdge edge : newGraph.getEdgesList()) {
             if (edge.hasCondition()) {
@@ -105,7 +105,7 @@ public class GraphCache {
             }
         }
         
-        // 4. Atomic swap
+        // 6. Atomic state swap (6)
         this.graph = newGraph;
         this.version = newGraph.getVersion();
         this.nodeById = newNodeById;
@@ -114,6 +114,14 @@ public class GraphCache {
     }
 }
 ```
+
+#### Code Deep Dive:
+1. **Volatile References**: Ensures that all processing threads immediately see the new graph definition once the `rebuild` is complete.
+2. **Specialized Indexes**: Instead of traversing the graph list for every document, the engine uses maps for O(1) lookups of nodes and edges.
+3. **Node Index**: Allows immediate access to a node's configuration by its UUID.
+4. **Adjacency List**: Pre-groups edges by their source node, which is essential for fast routing decisions during document fan-out.
+5. **Expression Pre-compilation**: Compiling Common Expression Language (CEL) conditions is an expensive operation. By doing it once during the cache rebuild, the engine avoids repetitive work during the critical processing loop.
+6. **Atomic Update**: By swapping all references at the end of the method, the engine ensures that a processing thread never sees a partially updated or inconsistent graph state.
 
 ### Optimization Details
 - **Node Indexing**: O(1) lookup of node configurations by ID.
@@ -153,18 +161,18 @@ The versioning strategy ensures that updates are sequential and that only one ve
 ```java
 @Transactional
 public PipelineGraph saveGraph(PipelineGraph graph) {
-    // 1. Get next version
+    // 1. Version management (1)
     long nextVersion = graphRepo.getMaxVersion(graph.getGraphId()) + 1;
     
-    // 2. Deactivate current active versions
+    // 2. Exclusive activation (2)
     graphRepo.deactivateAll(graph.getGraphId());
     
-    // 3. Prepare versioned snapshot
+    // 3. Immutable snapshot (3)
     PipelineGraph versioned = graph.toBuilder()
         .setVersion(nextVersion)
         .build();
     
-    // 4. Insert new active version
+    // 4. Persistence (4)
     graphRepo.insert(GraphEntity.builder()
         .graphId(graph.getGraphId())
         .clusterId(graph.getClusterId())
@@ -173,12 +181,19 @@ public PipelineGraph saveGraph(PipelineGraph graph) {
         .isActive(true)
         .build());
     
-    // 5. Broadcast update
+    // 5. Distributed broadcast (5)
     kafkaProducer.send("graph-updates", versioned);
     
     return versioned;
 }
 ```
+
+#### Code Deep Dive:
+1. **Incremental Versioning**: Ensures every update is unique and traceable. Versions are scoped per logical `graph_id`.
+2. **Deactivation**: Before the new version is marked active, all previous active versions are cleared. This prevents "dual-active" states in the database.
+3. **Proto Versioning**: The version number is baked into the Protobuf message itself, ensuring the engine can always identify the version of the graph it is currently running.
+4. **JSONB Storage**: The complete graph structure is stored as a JSON blob in Postgres, allowing for flexible schema evolution without complex table migrations.
+5. **Update Event**: Publishing to Kafka ensures that all distributed engine instances receive the update simultaneously, triggering their internal cache rebuilds.
 
 ## In-Flight Stream Handling
 

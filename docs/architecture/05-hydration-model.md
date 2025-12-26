@@ -14,11 +14,21 @@ The `DocumentReference` provides the **logical coordinates** needed to retrieve 
 
 ```protobuf
 message DocumentReference {
-  string doc_id = 1;           // Document identifier
-  string source_node_id = 2;   // Node that produced this version
-  string account_id = 3;       // Account for multi-tenant isolation
+  // 1. Unique document identifier (1)
+  string doc_id = 1;
+  
+  // 2. State management (2)
+  string source_node_id = 2;
+  
+  // 3. Multi-tenant context (3)
+  string account_id = 3;
 }
 ```
+
+#### Code Deep Dive:
+1. **Document ID**: The UUID that identifies the core document across all its versions and hops.
+2. **Node ID**: Identifies exactly which node produced the version of the document being referenced. This is critical for fetching the correct state from the Repository.
+3. **Account Isolation**: Ensures that hydration requests are scoped to the correct tenant, preventing cross-account data access.
 
 ## Storage Abstraction
 
@@ -67,11 +77,10 @@ The engine handles hydration within its processing loop, checking the requiremen
 void processNode(PipeStream stream) {
     String accountId = stream.getMetadata().getAccountId();
     
-    // 1. Level 1 Hydration: Reference -> Metadata
+    // 1. Level 1 Hydration (1)
     PipeDoc doc;
     if (stream.hasDocumentRef()) {
         DocumentReference ref = stream.getDocumentRef();
-        // Engine only passes logical coordinates - Repo Service resolves storage
         doc = repoService.getPipeDoc(
             ref.getDocId(), 
             ref.getSourceNodeId(), 
@@ -81,16 +90,16 @@ void processNode(PipeStream stream) {
         doc = stream.getDocument();
     }
     
-    // 2. Level 2 Hydration: Reference -> Binary Bytes
+    // 2. Module capability check (2)
     GraphNode node = graphCache.getNode(stream.getCurrentNodeId());
     ModuleCapabilities caps = getModuleCapabilities(node.getModuleId());
     
+    // 3. Level 2 Hydration (3)
     if (caps.needsBlobContent() && doc.getBlobBag().getBlob().hasStorageRef()) {
         FileStorageReference ref = doc.getBlobBag().getBlob().getStorageRef();
-        // Repo Service handles actual storage retrieval
         byte[] blobData = repoService.getBlob(ref);
         
-        // Inline the bytes for the module
+        // 4. Inlining the bytes (4)
         doc = doc.toBuilder()
             .setBlobBag(doc.getBlobBag().toBuilder()
                 .setBlob(doc.getBlobBag().getBlob().toBuilder()
@@ -101,10 +110,17 @@ void processNode(PipeStream stream) {
             .build();
     }
     
-    // Call module with hydrated document
+    // 5. Module invocation (5)
     ProcessDataResponse response = callModule(node, doc);
 }
 ```
+
+#### Code Deep Dive:
+1. **Metadata Retrieval**: If the document is currently a reference (common in Kafka paths), it is promoted to a full `PipeDoc` metadata object.
+2. **On-Demand Logic**: The engine checks if the specific module assigned to this node (e.g., Tika Parser) actually requires the raw binary content.
+3. **Blob Fetching**: Only if the module needs it, the engine makes a second call to the Repository Service to fetch the raw bytes from S3. This minimizes network traffic for modules like chunkers or embedders that only work with text.
+4. **Hydration**: The raw bytes are injected directly into the `PipeDoc` object, and the storage reference is cleared to indicate that the document is now fully hydrated for this step.
+5. **Remote Call**: The hydrated document is sent to the module. Because the bytes are inline, the module doesn't need to know anything about storage or the Repository Service.
 
 ## Deep Dive: Hydration Decisions
 
@@ -159,11 +175,12 @@ void routeToNextNode(PipeStream stream, PipeDoc doc, GraphEdge edge) {
     String currentNodeId = stream.getCurrentNodeId();
     String accountId = stream.getMetadata().getAccountId();
     
+    // 1. Transport decision (1)
     if (edge.getTransportType() == TRANSPORT_TYPE_MESSAGING) {
-        // MUST persist and dehydrate for Kafka
-        // Repo Service handles where/how it's stored
+        // 2. Mandatory persistence for Kafka (2)
         repoService.savePipeDoc(doc, currentNodeId, accountId);
         
+        // 3. Dehydration (3)
         PipeStream dehydrated = stream.toBuilder()
             .clearDocument()
             .setDocumentRef(DocumentReference.newBuilder()
@@ -174,9 +191,10 @@ void routeToNextNode(PipeStream stream, PipeDoc doc, GraphEdge edge) {
             .setCurrentNodeId(edge.getToNodeId())
             .build();
             
+        // 4. Kafka publish (4)
         kafkaProducer.send(edge.getKafkaTopic(), dehydrated);
     } else {
-        // gRPC path - keep document inline
+        // 5. gRPC fast-path (5)
         PipeStream next = stream.toBuilder()
             .setDocument(doc)
             .setCurrentNodeId(edge.getToNodeId())
@@ -186,6 +204,13 @@ void routeToNextNode(PipeStream stream, PipeDoc doc, GraphEdge edge) {
     }
 }
 ```
+
+#### Code Deep Dive:
+1. **Transport Type**: Routing logic branches based on whether the next hop is synchronous (gRPC) or asynchronous (Kafka/Messaging).
+2. **Persistence Guarantee**: Before a document can be sent over Kafka, its current state *must* be saved to the Repository Service. This ensures that any instance in the cluster can hydrate it later.
+3. **Dehydration**: The full `PipeDoc` is removed from the stream and replaced with a lightweight `DocumentReference`. This prevents "message too large" errors in Kafka.
+4. **Reliable Path**: The dehydrated stream is published to the node-specific Kafka topic.
+5. **In-Memory Handoff**: For gRPC edges, the full hydrated document is kept in the message. This avoids the overhead of intermediate storage and is significantly faster for same-cluster communication.
 
 ```mermaid
 sequenceDiagram
