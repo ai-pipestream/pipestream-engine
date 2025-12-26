@@ -1,109 +1,290 @@
 # Scaling Model
 
-The Pipestream Scaling Model ensures the system can handle massive document throughput while maintaining cost-efficiency. By separating the baseline "always-on" orchestration (Engine) from the demand-driven "scale-to-zero" processing (Modules), the architecture optimizes for both low-latency performance and high-volume burst capacity.
+The Pipestream Scaling Model keeps things simple: monitor key metrics, scale when thresholds are crossed. Start with conservative settings and tune based on real-world data.
 
-### Scaling Architecture
-- **Engine Pool (Horizontal Scaling)**: Engines are scaled based on CPU utilization and gRPC request latency. They maintain a baseline presence to handle real-time traffic from the intake service and other engines.
-- **Remote Modules (Scale-to-Zero)**: Modules like parsers and embedders are scaled using KEDA (Kubernetes Event-Driven Autoscaling). They can scale to zero when no documents are in the pipeline, eliminating idle costs for expensive resources like GPUs.
-- **Kafka Buffering**: Kafka acts as a shock absorber, allowing the system to ingest documents at a higher rate than the modules can immediately process. Scaling triggers (like consumer lag) ensure the processing capacity catches up with the ingestion volume.
+## What Needs to Scale
 
-### Module Scaling (KEDA) Implementation
+| Component | When to Scale Up | When to Scale Down |
+|-----------|------------------|-------------------|
+| **Engine + Sidecar** | Kafka lag growing, CPU high | Lag cleared, CPU low |
+| **Modules (CPU)** | Request latency increasing | Requests drop |
+| **Modules (GPU)** | Same as CPU, but scale to zero when idle | No pending work |
 
-Modules are scaled based on the volume of work pending in their respective Kafka topics or the rate of gRPC requests they receive.
+## Key Metrics to Monitor
+
+### Engine + Sidecar
+
+| Metric | Threshold (starting point) | Action |
+|--------|---------------------------|--------|
+| CPU utilization | > 70% for 5 min | Add instance |
+| Kafka consumer lag | > 1000 messages | Add instance |
+| gRPC latency p99 | > 500ms | Add instance |
+
+### Modules
+
+| Metric | Threshold (starting point) | Action |
+|--------|---------------------------|--------|
+| gRPC request queue | > 10 pending | Add instance |
+| Processing latency p99 | > 2s (CPU) / > 10s (GPU) | Add instance |
+| No requests | 5 min idle | Scale down (to zero for GPU) |
+
+## Scaling Principles
+
+**Start simple:**
+- Begin with fixed instance counts
+- Add autoscaling when you see patterns
+- Tune thresholds based on actual load
+
+**Separate concerns:**
+- Engine/Sidecar: Always-on, scale horizontally
+- CPU Modules: Scale with load, can stay at minimum 1
+- GPU Modules: Scale to zero when idle (cost savings)
+
+**Kafka as buffer:**
+- Kafka absorbs burst traffic
+- Lag is expected during spikes
+- Scale based on lag growth rate, not absolute lag
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     SCALING ZONES                                │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Always-On Pool (Engine + Sidecar)                      │    │
+│  │  • Scale: 2-10 instances based on CPU/lag               │    │
+│  │  • Never scale to zero                                  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Demand-Driven Pool (CPU Modules)                       │    │
+│  │  • Scale: 1-20 instances based on request load          │    │
+│  │  • Minimum 1 to avoid cold starts                       │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Scale-to-Zero Pool (GPU Modules)                       │    │
+│  │  • Scale: 0-5 instances based on pending work           │    │
+│  │  • Accept cold start latency for cost savings           │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Implementation: AWS Fargate
+
+Fargate uses CloudWatch Alarms and Application Auto Scaling.
+
+### Engine + Sidecar Service
+
+```json
+{
+  "serviceName": "pipestream-engine",
+  "desiredCount": 2,
+  "capacityProviderStrategy": [
+    {
+      "capacityProvider": "FARGATE",
+      "weight": 1
+    }
+  ]
+}
+```
+
+**Auto Scaling Policy (CPU-based):**
+
+```json
+{
+  "policyName": "engine-cpu-scaling",
+  "policyType": "TargetTrackingScaling",
+  "targetTrackingScalingPolicyConfiguration": {
+    "targetValue": 70.0,
+    "predefinedMetricSpecification": {
+      "predefinedMetricType": "ECSServiceAverageCPUUtilization"
+    },
+    "scaleInCooldown": 300,
+    "scaleOutCooldown": 60
+  }
+}
+```
+
+**Auto Scaling Policy (Kafka lag via custom metric):**
+
+```json
+{
+  "policyName": "engine-lag-scaling",
+  "policyType": "TargetTrackingScaling",
+  "targetTrackingScalingPolicyConfiguration": {
+    "targetValue": 1000.0,
+    "customizedMetricSpecification": {
+      "metricName": "ConsumerLag",
+      "namespace": "Pipestream/Kafka",
+      "statistic": "Maximum",
+      "dimensions": [
+        {
+          "name": "ConsumerGroup",
+          "value": "pipestream-sidecar"
+        }
+      ]
+    },
+    "scaleInCooldown": 300,
+    "scaleOutCooldown": 60
+  }
+}
+```
+
+### GPU Module (Scale to Zero)
+
+Fargate doesn't natively support scale-to-zero, but you can approximate it:
+
+```json
+{
+  "serviceName": "embedder-module",
+  "desiredCount": 0,
+  "capacityProviderStrategy": [
+    {
+      "capacityProvider": "FARGATE",
+      "weight": 1
+    }
+  ]
+}
+```
+
+Use a Lambda or Step Function to:
+1. Watch for messages on embedder topic
+2. Set `desiredCount = 1` when work appears
+3. Set `desiredCount = 0` after 5 min idle
+
+## Implementation: Kubernetes
+
+Kubernetes uses HPA for CPU-based scaling and KEDA for event-driven scaling.
+
+### Engine + Sidecar Deployment
 
 ```yaml
-# KEDA ScaledObject for GPU Embedder
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipestream-engine
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: engine
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+        - name: sidecar
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+            limits:
+              cpu: "1"
+              memory: "4Gi"
+```
+
+**HPA (CPU-based):**
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: engine-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: pipestream-engine
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+**KEDA (Kafka lag-based):**
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: engine-kafka-scaler
+spec:
+  scaleTargetRef:
+    name: pipestream-engine
+  minReplicaCount: 2
+  maxReplicaCount: 10
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka:9092
+        consumerGroup: pipestream-sidecar
+        topic: pipestream.cluster1.node-001
+        lagThreshold: "1000"
+```
+
+### GPU Module (Scale to Zero with KEDA)
+
+```yaml
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
   name: embedder-scaler
 spec:
   scaleTargetRef:
-    name: embedder
-  // 1. Scale-to-zero (1)
-  minReplicaCount: 0              
-  maxReplicaCount: 10
-  cooldownPeriod: 300             
+    name: embedder-module
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  cooldownPeriod: 300
   triggers:
-    // 2. Throughput-based scaling (2)
-    - type: prometheus            
+    - type: prometheus
       metadata:
+        serverAddress: http://prometheus:9090
         query: sum(rate(grpc_server_started_total{service="embedder"}[1m]))
-        threshold: "10"
-    // 3. Backlog-based scaling (3)
-    - type: kafka                 
-      metadata:
-        topic: prod.embedder
-        lagThreshold: "5"
+        threshold: "1"
 ```
 
-#### Code Deep Dive:
-1. **Cost Optimization**: Setting `minReplicaCount: 0` ensures that expensive resources (like GPU nodes) are completely released when no documents are waiting to be processed.
-2. **Predictive Scaling**: By monitoring the rate of gRPC requests (via Prometheus), KEDA can scale up the module instances as soon as traffic begins to flow from the Engines.
-3. **Reactive Scaling**: Monitoring Kafka consumer lag provides a safety net. If documents are piling up in the messaging layer faster than they can be processed, KEDA will spawn additional instances to clear the backlog.
+## Comparison
 
-### Deep Dive: Workload Optimization
+| Aspect | Fargate | Kubernetes |
+|--------|---------|------------|
+| **Setup complexity** | Lower | Higher |
+| **Scale-to-zero** | Manual (Lambda trigger) | Native (KEDA) |
+| **Kafka lag scaling** | Custom metric required | KEDA built-in |
+| **GPU support** | Limited | Better |
+| **Cost model** | Pay per task-hour | Pay for nodes |
+| **Cold start** | ~30-60s | ~10-30s |
+| **Operational overhead** | AWS managed | You manage cluster |
 
-Pipestream distinguishes between orchestration load and processing load to maximize resource utilization:
+## Recommendations
 
-- **Orchestration Load**: Engine tasks (mapping, routing, hydration) are lightweight and CPU-bound. These are handled by a stable pool of engines that scale traditionally via HPA (Horizontal Pod Autoscaler).
-- **Processing Load**: Module tasks (OCR, embedding, chunking) are heavy and often require specialized hardware. These are treated as "functions-as-a-service" that only exist when work is available.
-- **Cold Start Mitigation**: While modules can scale to zero, the first document in a burst may experience a slight delay. Kafka persistence ensures no data is lost during the 10-30 seconds it takes for a module pod to initialize.
-- **Multi-Tenant Isolation**: Scaling can be tuned per account or cluster, ensuring that a spike in one tenant's ingestion doesn't starve the resources of another.
+**Start here:**
+1. Fixed instance counts initially
+2. Monitor metrics for a week
+3. Add CPU-based autoscaling
+4. Add lag-based scaling if needed
+5. Tune thresholds based on observed patterns
 
-### Visualization of Scaling Dynamics
+**Don't over-optimize:**
+- Kafka handles bursts naturally
+- A few seconds of lag is fine
+- Cold starts for GPU modules are acceptable
+- Scale down slowly, scale up quickly
 
-```mermaid
-graph TD
-    Intake[Intake Service] -- "High Volume Burst" --> K[[Kafka]]
-    
-    subgraph ControlPlane [Always-On Pool]
-        E1[Engine]
-        E2[Engine]
-        E3[Engine]
-    end
-    
-    K --> E1
-    E1 -- "gRPC Call" --> M1[Parser Module]
-    
-    subgraph ProcessingPlane [Demand-Driven Pool]
-        M1
-        M2[Parser Module]
-        M3[Parser Module]
-    end
-    
-    KEDA[KEDA Controller] -- "Monitor Lag" --> K
-    KEDA -- "Scale 0 -> N" --> ProcessingPlane
-    
-    HPA[HPA Controller] -- "Monitor CPU" --> ControlPlane
-    HPA -- "Scale N -> M" --> ControlPlane
-```
+**Cost vs Latency tradeoff:**
 
-### Cost Efficiency Comparison
-
-| Component | Scaling Strategy | Idle Cost | Peak Capacity |
-|-----------|------------------|-----------|---------------|
-| **Engine** | HPA (CPU/RAM) | Low (Fixed) | High (Elastic) |
-| **Parser (CPU)** | KEDA (Lag/Rate) | **Zero** | High (Elastic) |
-| **Embedder (GPU)** | KEDA (Lag/Rate) | **Zero** | Moderate (GPU Limited) |
-| **Sinks** | KEDA (Lag) | **Zero** | High (Elastic) |
-
-### Batch Ingestion Flow
-
-```mermaid
-sequenceDiagram
-    participant I as Intake
-    participant K as Kafka
-    participant KD as KEDA
-    participant M as Module
-    participant E as Engine
-    
-    I->>K: 100k Docs Published
-    K->>KD: Lag detected (>100)
-    KD->>M: Scale 0 -> 10 Pods
-    Note over M: Pods Initialization
-    K->>E: Engine consumes
-    E->>M: ProcessData(gRPC)
-    M-->>E: Success
-    KD->>M: No lag, Scale back to 0
-```
+| Priority | Engine Min | CPU Module Min | GPU Module Min |
+|----------|------------|----------------|----------------|
+| **Low cost** | 1 | 1 | 0 |
+| **Balanced** | 2 | 1 | 0 |
+| **Low latency** | 3+ | 2+ | 1 |
