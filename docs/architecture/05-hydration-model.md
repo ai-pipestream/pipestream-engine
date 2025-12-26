@@ -5,12 +5,12 @@ The Hydration Model defines how the PipeStream engine retrieves document content
 ## Hydration Levels
 
 - **Level 1: Document Hydration**: Resolves a `DocumentReference` into a full `PipeDoc` metadata object. This is typically done by the Kafka Sidecar or the Engine when a gRPC sender provides only a reference.
-- **Level 2: Blob Hydration**: Fetches the raw binary content (bytes) from S3 via the Repo Service. This is an on-demand process triggered only if the target module (like a parser) requires the raw file for processing.
+- **Level 2: Blob Hydration**: Fetches the raw binary content (bytes) via the Repo Service. This is an on-demand process triggered only if the target module (like a parser) requires the raw file for processing.
 - **Dehydration**: The inverse process where a full document is replaced by a reference after persistence, ensuring Kafka message size limits (10MB) are respected.
 
 ## DocumentReference Proto
 
-The `DocumentReference` provides the coordinates needed to retrieve a document from storage:
+The `DocumentReference` provides the **logical coordinates** needed to retrieve a document. No storage details (S3 paths, bucket names) are exposed:
 
 ```protobuf
 message DocumentReference {
@@ -19,6 +19,45 @@ message DocumentReference {
   string account_id = 3;       // Account for multi-tenant isolation
 }
 ```
+
+## Storage Abstraction
+
+**Critical Design Point:** The Engine and Sidecar never see S3 details. All storage is abstracted through the Repo Service gRPC API.
+
+```mermaid
+graph TD
+    subgraph EngineView [What Engine/Sidecar See]
+        DR[DocumentReference]
+        API1[repoService.getPipeDoc]
+        API2[repoService.savePipeDoc]
+        API3[repoService.getBlob]
+    end
+    
+    subgraph RepoInternal [Repo Service Internals - Hidden]
+        S3[S3 Storage]
+        Paths[Path Resolution]
+        Auth[Authentication]
+        Cache[Caching Layer]
+        Encrypt[Encryption]
+    end
+    
+    DR --> API1
+    API1 --> RepoInternal
+    API2 --> RepoInternal
+    API3 --> RepoInternal
+    RepoInternal --> S3
+```
+
+| Layer | Knows About | Doesn't Know About |
+|-------|-------------|-------------------|
+| **Engine** | doc_id, node_id, account_id | S3 buckets, paths, keys |
+| **Sidecar** | doc_id, node_id, account_id | S3 buckets, paths, keys |
+| **Repo Service** | Everything | N/A - owns the abstraction |
+
+This ensures:
+- **Security**: S3 credentials and paths never leak to processing layer
+- **Flexibility**: Repo Service can change storage backend without affecting Engine
+- **Multi-tenancy**: Account isolation is enforced at the Repo Service level
 
 ## Engine Hydration Implementation
 
@@ -32,6 +71,7 @@ void processNode(PipeStream stream) {
     PipeDoc doc;
     if (stream.hasDocumentRef()) {
         DocumentReference ref = stream.getDocumentRef();
+        // Engine only passes logical coordinates - Repo Service resolves storage
         doc = repoService.getPipeDoc(
             ref.getDocId(), 
             ref.getSourceNodeId(), 
@@ -47,6 +87,7 @@ void processNode(PipeStream stream) {
     
     if (caps.needsBlobContent() && doc.getBlobBag().getBlob().hasStorageRef()) {
         FileStorageReference ref = doc.getBlobBag().getBlob().getStorageRef();
+        // Repo Service handles actual storage retrieval
         byte[] blobData = repoService.getBlob(ref);
         
         // Inline the bytes for the module
@@ -79,24 +120,7 @@ The hydration strategy is optimized for the "Fast Path" where documents move via
 
 - **Selective Fetching**: Level 2 hydration is only performed if `needsBlobContent()` is true. Parsers (Tika, Docling) need blobs; Chunkers and Embedders do not.
 - **Sidecar Responsibility**: When documents arrive via Kafka, the Sidecar performs Level 1 hydration before the Engine ever sees the request, keeping the Engine's gRPC interface consistent.
-- **Repo Service Abstraction**: Neither the Engine nor the Sidecar access S3 directly. They use the Repo Service gRPC API, which manages authentication, path resolution, and caching.
-
-## Storage Structure
-
-Documents are stored in S3 using a node-centric hierarchy:
-
-```
-s3://{bucket}/
-  └── {node-uuid}/
-      ├── {doc-id-1}.pipedoc
-      ├── {doc-id-2}.pipedoc
-      └── ... (millions of docs per node)
-```
-
-- **Node-centric**: Each node's outputs are stored in its own directory
-- **Account isolation**: Handled at the bucket or Repo Service level
-- **Scalable**: Millions of documents per node directory (S3 handles this well)
-- **Replayable**: All outputs from a node version are co-located
+- **Repo Service Abstraction**: Neither the Engine nor the Sidecar access storage directly. They use the Repo Service gRPC API, which manages authentication, path resolution, caching, and multi-tenant isolation.
 
 ## Visualization of Hydration Flow
 
@@ -119,11 +143,11 @@ graph TD
     E5 --> Module
     
     Repo[(Repo Service)]
-    S3[(S3 Storage)]
+    Storage[(Storage - Hidden)]
     
     KS2 -.-> Repo
     E3 -.-> Repo
-    Repo --- S3
+    Repo --- Storage
 ```
 
 ## Dehydration Flow (Post-Processing)
@@ -137,6 +161,7 @@ void routeToNextNode(PipeStream stream, PipeDoc doc, GraphEdge edge) {
     
     if (edge.getTransportType() == TRANSPORT_TYPE_MESSAGING) {
         // MUST persist and dehydrate for Kafka
+        // Repo Service handles where/how it's stored
         repoService.savePipeDoc(doc, currentNodeId, accountId);
         
         PipeStream dehydrated = stream.toBuilder()
@@ -168,7 +193,8 @@ sequenceDiagram
     participant R as Repo Service
     participant K as Kafka
     
-    E->>R: savePipeDoc(full_doc, node_id, account_id)
+    E->>R: savePipeDoc(doc, node_id, account_id)
+    Note over R: Repo handles storage details
     R-->>E: Ack
     E->>E: Clear doc, Set doc_ref, Set next node
     E->>K: publish(dehydrated_stream)
