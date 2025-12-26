@@ -25,6 +25,66 @@ graph LR
     end
 ```
 
+## Node Inputs and Outputs
+
+Nodes in a pipeline graph can have **multiple inputs** and **multiple outputs**. Understanding this model is fundamental to designing flexible pipelines.
+
+### Input/Output Model
+- **Inputs are implicit**: A node receives documents from any edge that points TO it. You don't configure inputs on the node itself—they're determined by edges defined elsewhere in the graph.
+- **Outputs are explicit**: You define edges FROM your node to specify where documents go next. Each outgoing edge can have its own transport type, condition, and priority.
+- **Fan-In**: Multiple edges can point to the same node (e.g., multiple parsers feeding into a single chunker).
+- **Fan-Out**: A single node can have multiple outgoing edges (e.g., routing PDFs to one path and images to another).
+
+```mermaid
+graph LR
+    subgraph FanIn [Fan-In: Multiple Inputs]
+        A1[PDF Parser] --> C[Chunker]
+        A2[Word Parser] --> C
+        A3[HTML Parser] --> C
+    end
+
+    subgraph FanOut [Fan-Out: Multiple Outputs]
+        D[Router] --> E1[English Pipeline]
+        D --> E2[Spanish Pipeline]
+        D --> E3[Archive Sink]
+    end
+```
+
+### Key Points
+| Aspect | How It Works |
+|--------|--------------|
+| **Inputs** | Automatic - determined by edges pointing TO this node |
+| **Outputs** | Defined by edges you create FROM this node |
+| **Multiple inputs** | Yes - any number of edges can target a node (fan-in) |
+| **Multiple outputs** | Yes - define multiple edges from a node (fan-out) |
+| **Mixed transports** | Yes - one output edge can be gRPC, another Kafka |
+| **Conditional outputs** | Yes - each edge can have a CEL condition |
+
+### Example: Complex Routing
+
+```mermaid
+graph TD
+    Intake[Intake] --> Parser[Parser Node]
+    
+    Parser --> |"doc.type == 'PDF'"| PDFChunker[PDF Chunker]
+    Parser --> |"doc.type == 'IMAGE'"| OCR[OCR Module]
+    Parser --> |"doc.size > 10MB"| LargeDocQueue[Large Doc Queue via Kafka]
+    Parser --> |"always"| Audit[Audit Sink]
+    
+    PDFChunker --> Embedder[Embedder]
+    OCR --> Embedder
+    LargeDocQueue --> Embedder
+    
+    Embedder --> Index[Search Index]
+    Embedder --> Archive[S3 Archive]
+```
+
+In this example:
+- **Parser** has 4 outgoing edges (fan-out with conditions)
+- **Embedder** has 3 incoming edges (fan-in from different paths)
+- **Embedder** has 2 outgoing edges (fan-out to index and archive)
+- The "Large Doc Queue" edge uses Kafka transport; others use gRPC
+
 ## Edge Definition
 
 The `GraphEdge` defines the connection between two nodes, including the conditions under which the connection is followed and the transport mechanism used for the transfer.
