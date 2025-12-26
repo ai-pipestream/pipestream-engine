@@ -1,6 +1,6 @@
-# Engine Overview
+# Pipestream Engine Overview
 
-## What is the Engine?
+## What is the Pipestream Engine?
 
 The PipeStream Engine is the central orchestration service that routes documents through processing pipelines. It is a **pure gRPC service** that:
 
@@ -15,37 +15,30 @@ The PipeStream Engine is the central orchestration service that routes documents
 
 The engine doesn't know Kafka exists. All inputs arrive via gRPC:
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           ENGINE INPUTS                                          │
-│                                                                                  │
-│   Source              Transport       Engine Sees                               │
-│   ──────              ─────────       ───────────                               │
-│   Intake         ───► gRPC       ───► ProcessNodeRequest                        │
-│   Other Engine   ───► gRPC       ───► ProcessNodeRequest                        │
-│   Kafka Sidecar  ───► gRPC       ───► ProcessNodeRequest (same!)                │
-│                                                                                  │
-│   Engine code is identical regardless of source                                 │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph LR
+    Intake[Intake] -- gRPC --> Engine[ProcessNodeRequest]
+    OtherEngine[Other Engine] -- gRPC --> Engine
+    Sidecar[Kafka Sidecar] -- gRPC --> Engine
+    
+    subgraph EngineSees [Engine Sees]
+        Engine
+    end
 ```
 
 ### 2. Sidecar Handles Kafka Complexity
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                     COMPUTE TASK                                                 │
-│                                                                                  │
-│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐             │
-│  │  Consul Agent   │    │  Kafka Sidecar  │    │     Engine      │             │
-│  │                 │    │                 │    │                 │             │
-│  │  • Health check │◄───│  • Lease mgmt   │    │  • Pure gRPC    │             │
-│  │  • Service reg  │    │  • Consume      │───►│  • Stateless    │             │
-│  │                 │    │  • Hydrate S3   │    │  • Routes/maps  │             │
-│  │                 │    │  • Commit offset│◄───│  • Calls modules│             │
-│  └─────────────────┘    └─────────────────┘    └─────────────────┘             │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph LR
+    subgraph ComputeTask [Compute Task]
+        Consul["Consul Agent<br/>• Health check<br/>• Service reg"]
+        Sidecar["Kafka Sidecar<br/>• Lease mgmt<br/>• Consume<br/>• Hydrate S3<br/>• Commit offset"]
+        Engine["Engine<br/>• Pure gRPC<br/>• Stateless<br/>• Routes/maps<br/>• Calls modules"]
+
+        Sidecar <--> Consul
+        Sidecar -- gRPC --> Engine
+        Engine -- Commit --> Sidecar
+    end
 ```
 
 ### 3. Modules are Stateless Transformers
@@ -61,25 +54,31 @@ They simply: `PipeDoc in → transform → PipeDoc out`
 
 ### 4. Nodes are Logical Constructs
 
-```
-Physical Reality:                   Logical View (Graph):
+```mermaid
+graph TD
+    subgraph PhysicalReality [Physical Reality]
+        CT1[Compute Task 1]
+        CT2[Compute Task 2]
+        CTN[Compute Task N]
+        CT1 --- Sidecar1[Sidecar]
+        CT1 --- Engine1[Engine]
+        CT2 --- Sidecar2[Sidecar]
+        CT2 --- Engine2[Engine]
+        CTN --- SidecarN[Sidecar]
+        CTN --- EngineN[Engine]
+    end
 
-┌─────────────────────┐             ┌───────┐    ┌───────┐    ┌───────┐
-│  Compute Task 1     │             │ Parse │───►│ Chunk │───►│ Embed │
-│  ├── Sidecar        │             └───────┘    └───────┘    └───────┘
-│  └── Engine         │                                │
-├─────────────────────┤                                ▼
-│  Compute Task 2     │                          ┌───────┐
-│  ├── Sidecar        │                          │ Sink  │
-│  └── Engine         │                          └───────┘
-├─────────────────────┤
-│  Compute Task N     │             Node IDs are UUIDs like:
-│  ├── Sidecar        │               parser-abc-123-def
-│  └── Engine         │               chunker-xyz-789-ghi
-└─────────────────────┘
+    subgraph LogicalView [Logical View]
+        Parse --> Chunk --> Embed
+        Embed --> Sink
+    end
+
+%% Node IDs are UUIDs like:
+%% parser-abc-123-def
+%% chunker-xyz-789-ghi
 ```
 
-### 5. One Transport Per Edge
+### 5. One Transport Per Edge, Multiple Edges per Node
 
 | Transport | Use Case | Characteristics |
 |-----------|----------|------------------|
@@ -90,7 +89,7 @@ No mixing - each edge chooses one transport.
 
 ## Processing Flow
 
-```
+### Overview
 1. Receive PipeStream (gRPC - from any source)
 2. Hydrate Level 1: document_ref → PipeDoc (if needed)
 3. Filter (CEL) - skip node if false
@@ -102,6 +101,28 @@ No mixing - each edge chooses one transport.
 9. For each edge:
    - gRPC edge: call next engine directly
    - Kafka edge: persist to Repo, publish to Kafka
+
+### Visual Overview
+
+```mermaid
+flowchart TD
+    Start([Receive PipeStream gRPC]) --> Hydrate1["Hydrate Level 1: document_ref -> PipeDoc"]
+    Hydrate1 --> Filter{Filter CEL}
+    Filter -- false --> End([End])
+    Filter -- true --> PreMap[Pre-mapping CEL transforms]
+    PreMap --> Hydrate2["Hydrate Level 2: storage_ref -> bytes"]
+    Hydrate2 --> CallModule[Call Module gRPC]
+    CallModule --> PostMap[Post-mapping CEL transforms]
+    PostMap --> Edges{For each edge}
+    
+    Edges --> gRPC[gRPC edge]
+    Edges --> Kafka[Kafka edge]
+    
+    gRPC --> CallNext[Call next engine directly]
+    Kafka --> Persist[Persist to Repo & publish to Kafka]
+    
+    CallNext --> End
+    Persist --> End
 ```
 
 ## What's Embedded in Engine
