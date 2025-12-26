@@ -8,11 +8,6 @@
 # BlueJ files
 *.ctxt
 *.iml
-build
-bin
-.gradle
-.claude
-.dev-helpers
 
 # Mobile Tools for Java (J2ME)
 .mtj.tmp/
@@ -290,3 +285,19 @@ dist
 .yarn/install-state.gz
 .pnp.*
 
+# Gradle
+.gradle/
+build/
+!gradle-wrapper.jar
+!**/src/main/**
+!**/src/test/**
+bin
+.claude
+.dev-helpers
+
+# Quarkus
+target/
+quarkus.log
+
+# Dev services
+.pipeline/
