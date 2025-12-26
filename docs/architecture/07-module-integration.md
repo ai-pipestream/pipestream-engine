@@ -114,7 +114,7 @@ To maintain high performance and scalability, a strict separation of concerns is
 - **No Infrastructure Awareness**: Modules never talk to Kafka, S3, or Postgres. They receive all data via gRPC and return results the same way.
 - **No Routing Logic**: A module never decides where a document goes next; it only transforms the current document.
 - **Error Reporting**: Modules return a `success` flag and `error_details`. If success is `false`, the Engine logs the error in the document's history.
-- **Horizontal Scaling**: Modules are scaled independently by KEDA based on queue depth or CPU usage.
+- **Horizontal Scaling**: Modules are stateless and can be scaled independently based on load. GPU-intensive modules (embedders) can scale to zero when idle.
 
 ## Module Interaction Sequence
 
