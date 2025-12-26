@@ -78,8 +78,8 @@ public class GraphCache {
     public void rebuild(PipelineGraph newGraph) {
         // 1. Build Node Index
         Map<String, GraphNode> newNodeById = new HashMap<>();
-        for (String nodeId : newGraph.getNodeIdsList()) {
-            newNodeById.put(nodeId, lookupNode(nodeId));
+        for (GraphNode node : newGraph.getNodesList()) {
+            newNodeById.put(node.getNodeId(), node);
         }
         
         // 2. Build Adjacency List (Edges)
@@ -90,12 +90,18 @@ public class GraphCache {
                 .add(edge);
         }
         
-        // 3. Pre-compile CEL expressions
+        // 3. Pre-compile CEL expressions (edges + node filters)
         Map<String, CelProgram> newConditions = new HashMap<>();
         for (GraphEdge edge : newGraph.getEdgesList()) {
             if (edge.hasCondition()) {
-                newConditions.put(edge.getEdgeId(), 
+                newConditions.put("edge:" + edge.getEdgeId(), 
                     celCompiler.compile(edge.getCondition()));
+            }
+        }
+        for (GraphNode node : newGraph.getNodesList()) {
+            if (node.getProcessingConfig().hasFilterCondition()) {
+                newConditions.put("node:" + node.getNodeId(),
+                    celCompiler.compile(node.getProcessingConfig().getFilterCondition()));
             }
         }
         
@@ -112,7 +118,7 @@ public class GraphCache {
 ### Optimization Details
 - **Node Indexing**: O(1) lookup of node configurations by ID.
 - **Adjacency Mapping**: Pre-calculated outgoing edges to speed up routing decisions.
-- **CEL Pre-compilation**: Compiling Common Expression Language (CEL) conditions once during rebuild, rather than on every document hop.
+- **CEL Pre-compilation**: Compiling Common Expression Language (CEL) conditions once during rebuild, rather than on every document hop. This includes both edge routing conditions and node filter conditions.
 - **Atomic Swapping**: Uses `volatile` references to ensure that processing threads always see a consistent version of the graph during a switch.
 
 ```mermaid
@@ -120,11 +126,17 @@ graph TD
     Update[Kafka Update Received] --> Parse[Parse PipelineGraph Proto]
     Parse --> BuildNodes[Index Nodes by ID]
     Parse --> BuildEdges[Group Edges by Source Node]
-    Parse --> CompileCEL[Pre-compile Edge Conditions]
+    Parse --> CompileCEL[Pre-compile CEL Conditions]
+    
+    subgraph CEL [CEL Compilation]
+        CompileCEL --> EdgeCEL[Edge Routing Conditions]
+        CompileCEL --> NodeCEL[Node Filter Conditions]
+    end
     
     BuildNodes --> Swap[Atomic Reference Swap]
     BuildEdges --> Swap
-    CompileCEL --> Swap
+    EdgeCEL --> Swap
+    NodeCEL --> Swap
     
     Swap --> Active[Active Cache Used by Processing Loop]
 ```
