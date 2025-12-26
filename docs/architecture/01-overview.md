@@ -125,6 +125,56 @@ flowchart TD
     Persist --> End
 ```
 
+## Hydration Responsibilities
+
+Both the Engine and Kafka Sidecar can perform hydration, but they have **independent strategies** and both access S3 through the **Repo Service** (never directly):
+
+```mermaid
+graph TD
+    subgraph KafkaSidecar [Kafka Sidecar Hydration]
+        KS1[Receive Kafka message with document_ref]
+        KS2[Call Repo Service]
+        KS3[Get PipeDoc from S3]
+        KS4[Deliver hydrated PipeStream to Engine via gRPC]
+        KS1 --> KS2 --> KS3 --> KS4
+    end
+    
+    subgraph EngineHydration [Engine Hydration]
+        E1[Receive PipeStream via gRPC]
+        E2{Has document_ref?}
+        E3[Call Repo Service]
+        E4[Get PipeDoc from S3]
+        E5{Module needs blob?}
+        E6[Call Repo Service for blob]
+        E7[Get blob bytes from S3]
+        E1 --> E2
+        E2 -- yes --> E3 --> E4 --> E5
+        E2 -- no --> E5
+        E5 -- yes --> E6 --> E7
+    end
+    
+    RepoService[(Repo Service)]
+    S3[(S3)]
+    
+    KS2 --> RepoService
+    E3 --> RepoService
+    E6 --> RepoService
+    RepoService --> S3
+```
+
+| Component | Hydration Responsibility | When |
+|-----------|-------------------------|------|
+| **Kafka Sidecar** | Level 1: `document_ref` → `PipeDoc` | Always (Kafka messages only contain refs) |
+| **Engine** | Level 1: `document_ref` → `PipeDoc` | When gRPC sender used a ref (rare, for >2GB docs) |
+| **Engine** | Level 2: `storage_ref` → blob bytes | When module needs blob content (parsers) |
+
+**Key points:**
+- Kafka Sidecar handles its own hydration before calling Engine
+- Engine handles hydration for gRPC-delivered documents when needed
+- Both use **Repo Service gRPC API** - never access S3 directly
+- For now, gRPC path rarely needs Level 1 hydration (2GB limit is generous)
+- Level 2 blob hydration is always Engine's responsibility
+
 ## What's Embedded in Engine
 
 | Component | Purpose |
@@ -143,3 +193,4 @@ flowchart TD
 | **Topic Leases** | Consul (via sidecar) |
 | **Document Storage** | Repo Service + S3 |
 | **Module Logic** | Remote Module Services |
+| **Direct S3 Access** | Never - always through Repo Service |
