@@ -1,13 +1,23 @@
 # Transport & Routing
 
+## Overview
+
+**gRPC is the primary transport.** Most document processing flows through synchronous gRPC calls:
+
+```
+Intake ──gRPC──► Engine ──gRPC──► Module ──gRPC──► Engine ──gRPC──► Module ──gRPC──► ...
+```
+
+**Kafka is for specific edges** where asynchronous, buffered, or cross-cluster transport is needed.
+
 ## Transport Types
 
-Transport is defined on **edges**, not nodes. Each edge specifies how to send to its target:
+Transport is defined on **edges**, not nodes. Each edge specifies how to reach its target:
 
 | Transport | Proto Value | Use Case | Behavior |
 |-----------|-------------|----------|----------|
-| **Kafka** | `TRANSPORT_TYPE_MESSAGING` | Async, batch, cost-sensitive | Buffered, rewindable |
-| **gRPC** | `TRANSPORT_TYPE_GRPC` | Real-time, latency-sensitive | Direct call |
+| **gRPC** | `TRANSPORT_TYPE_GRPC` | Default, real-time, most processing | Direct call, low latency |
+| **Kafka** | `TRANSPORT_TYPE_MESSAGING` | Cross-cluster, async buffering, batch | Buffered, requires persistence |
 
 ## Edge Definition
 
@@ -27,62 +37,76 @@ message GraphEdge {
   
   // Transport
   TransportType transport_type = 8;
-  optional string kafka_topic = 9;  // Override default
+  optional string kafka_topic = 9;  // Override default if Kafka
   
   // Loop prevention
   int32 max_hops = 10;
 }
 ```
 
-## Kafka Transport (Async)
+## gRPC Transport (Primary)
 
 ```
-┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐
-│ Engine  │────▶│   S3    │────▶│  Kafka  │────▶│ Engine  │
-│ (sender)│     │(offload)│     │ (topic) │     │(receiver)│
-└─────────┘     └─────────┘     └─────────┘     └─────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                     gRPC FLOW (TYPICAL)                          │
+│                                                                  │
+│  Engine ────gRPC call────► Module                               │
+│     │                         │                                  │
+│     │   PipeDoc inline        │   PipeDoc inline                │
+│     │   (no persistence)      │   (no persistence)              │
+│     │                         │                                  │
+│     │◄────gRPC response───────┘                                  │
+│     │                                                            │
+│     └────gRPC call────► Next Engine/Module                      │
+│                                                                  │
+│  Benefits:                                                       │
+│  • Low latency (no Kafka hop)                                   │
+│  • No mandatory persistence                                     │
+│  • Simple request/response                                      │
+│  • 2GB payload limit (plenty for most docs)                     │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**Flow:**
-1. Engine offloads PipeDoc to S3 via Repo Service
-2. PipeStream (with S3 reference, not inline doc) published to Kafka
-3. Target engine consumes from topic
-4. Target engine hydrates PipeDoc from S3
+**When to use gRPC:**
+- Default for all edges unless Kafka is specifically needed
+- Latency-sensitive processing
+- Small to medium documents
+- Same-cluster routing
 
-**Benefits:**
-- Kafka messages stay small (just metadata + S3 ref)
-- Natural backpressure via consumer lag
-- Rewindable - replay from any offset
-- Decoupled - sender doesn't wait for receiver
-
-**S3 Key Convention:**
-```
-s3://{bucket}/streams/{account_id}/{stream_id}/{node_id}.pb
-```
-
-## gRPC Transport (Sync)
+## Kafka Transport (Specific Edges)
 
 ```
-┌─────────┐                      ┌─────────┐
-│ Engine  │──────gRPC call──────▶│ Engine  │
-│ (sender)│      (inline doc)    │(receiver)│
-└─────────┘                      └─────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                     KAFKA FLOW                                   │
+│                                                                  │
+│  Engine ──► Repo.SavePipeDoc() ──► S3                           │
+│     │                                                            │
+│     └──► Kafka.publish(topic, PipeStream with document_ref)     │
+│                           │                                      │
+│                           ▼                                      │
+│                    ┌──────────────┐                             │
+│                    │    Kafka     │                             │
+│                    │   (buffered) │                             │
+│                    └──────────────┘                             │
+│                           │                                      │
+│                           ▼                                      │
+│  Target Engine ◄── Kafka.consume()                              │
+│     │                                                            │
+│     └──► Repo.GetPipeDoc(document_ref) ──► S3                   │
+│                                                                  │
+│  Constraints:                                                    │
+│  • 10MB message limit → MUST use document_ref                   │
+│  • Requires persistence before publish                          │
+│  • Adds latency (Kafka + S3 round trips)                        │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**Flow:**
-1. Engine calls target engine's `ProcessNode` RPC directly
-2. PipeDoc sent inline (or S3 ref for large payloads)
-3. Sender waits for response
-
-**Benefits:**
-- Lower latency (no Kafka hop)
-- Immediate feedback on success/failure
-- Simpler for real-time paths
-
-**Drawbacks:**
-- No replay capability
-- Sender blocked during processing
-- Tight coupling
+**When to use Kafka:**
+- Cross-cluster routing
+- Batch ingestion buffering
+- Decoupling (producer doesn't wait for consumer)
+- Replay/reprocessing capability needed
+- Large documents (over gRPC comfort zone)
 
 ## CEL Conditional Routing
 
@@ -100,42 +124,9 @@ doc.search_metadata.source_uri.startsWith("s3://sensitive-bucket/")
 
 // Check field existence
 has(doc.search_metadata.doi)
-
-// Route by tag
-"legal" in doc.search_metadata.tags.tag_data
-
-// Complex condition
-doc.search_metadata.mime_type == "application/pdf" && 
-doc.search_metadata.content_length > 1000000
 ```
 
-### CEL Evaluation
-
-```java
-public class CelEvaluator {
-    private final CelCompiler compiler;
-    private final CelRuntime runtime;
-    
-    public CelEvaluator() {
-        this.compiler = CelCompilerFactory.standardCelCompilerBuilder()
-            .addMessageTypes(PipeDoc.getDescriptor())
-            .addVar("doc", StructTypeReference.create(PipeDoc.getDescriptor().getFullName()))
-            .build();
-        this.runtime = CelRuntimeFactory.standardCelRuntimeBuilder().build();
-    }
-    
-    public CelProgram compile(String expression) {
-        CelAbstractSyntaxTree ast = compiler.compile(expression).getAst();
-        return runtime.createProgram(ast);
-    }
-    
-    public boolean evaluate(CelProgram program, PipeDoc doc) {
-        return (Boolean) program.eval(Map.of("doc", doc));
-    }
-}
-```
-
-## Routing Algorithm
+### Routing Algorithm
 
 ```java
 List<GraphEdge> resolveMatchingEdges(String nodeId, PipeDoc doc) {
@@ -164,31 +155,59 @@ List<GraphEdge> resolveMatchingEdges(String nodeId, PipeDoc doc) {
 }
 ```
 
-## Topic Management
-
-Engine dynamically manages Kafka subscriptions:
+## Routing by Transport Type
 
 ```java
-void onGraphUpdate(PipelineGraph graph) {
-    Set<String> requiredTopics = new HashSet<>();
+void routeToNextNode(PipeStream stream, PipeDoc doc, GraphEdge edge) {
+    String accountId = stream.getMetadata().getAccountId();
+    String currentNodeId = stream.getCurrentNodeId();
     
-    // Collect all topics this engine should consume
-    for (GraphNode node : graph.getNodesList()) {
-        if (shouldHandleNode(node)) {
-            requiredTopics.add(node.getKafkaInputTopic());
+    if (edge.getTransportType() == TRANSPORT_TYPE_MESSAGING) {
+        // KAFKA: Must persist, send reference
+        repoService.savePipeDoc(doc, currentNodeId, accountId);
+        
+        PipeStream dehydrated = stream.toBuilder()
+            .clearDocument()
+            .setDocumentRef(DocumentReference.newBuilder()
+                .setDocId(doc.getDocId())
+                .setSourceNodeId(currentNodeId)
+                .setAccountId(accountId)
+                .build())
+            .setCurrentNodeId(edge.getToNodeId())
+            .build();
+        
+        String topic = edge.hasKafkaTopic() 
+            ? edge.getKafkaTopic()
+            : graphCache.getNode(edge.getToNodeId()).getKafkaInputTopic();
+        
+        kafkaProducer.send(topic, dehydrated);
+        
+    } else {
+        // GRPC: Can pass inline (default) or reference (large docs)
+        PipeStream next = stream.toBuilder()
+            .setCurrentNodeId(edge.getToNodeId())
+            .setDocument(doc)
+            .setHopCount(stream.getHopCount() + 1)
+            .build();
+        
+        if (edge.getIsCrossCluster()) {
+            engineClient.routeToCluster(edge.getToClusterId(), next);
+        } else {
+            processNode(next);  // Local recursive call or queue
         }
     }
-    
-    // Diff with current subscriptions
-    Set<String> toSubscribe = difference(requiredTopics, currentTopics);
-    Set<String> toUnsubscribe = difference(currentTopics, requiredTopics);
-    
-    // Update subscriptions
-    kafkaConsumer.subscribe(toSubscribe);
-    kafkaConsumer.unsubscribe(toUnsubscribe);
-    
-    currentTopics = requiredTopics;
 }
+```
+
+## Topic Naming Convention
+
+```
+{environment}.{cluster}.{node-uuid}
+
+Examples:
+prod.us-east.abc123-def456-parser-node
+prod.us-east.xyz789-chunker-node
+staging.default.test-embedder-node
 ```
 
 ## Cross-Cluster Routing
@@ -197,20 +216,13 @@ When `edge.is_cross_cluster = true`:
 
 ```java
 void routeCrossCluster(PipeStream stream, PipeDoc doc, GraphEdge edge) {
-    // Always use Kafka for cross-cluster (reliability)
-    String bridgeTopic = "bridge." + edge.getToClusterId() + "." + edge.getToNodeId();
+    // Always use Kafka for cross-cluster (reliability + decoupling)
+    // Same as Kafka transport above, but target topic is in different cluster
     
-    // Offload doc
-    String docRef = repoService.savePipeDoc(doc);
+    String bridgeTopic = edge.hasKafkaTopic()
+        ? edge.getKafkaTopic()
+        : "bridge." + edge.getToClusterId() + "." + edge.getToNodeId();
     
-    // Publish with cluster routing metadata
-    PipeStream crossClusterStream = stream.toBuilder()
-        .clearDocument()
-        .setDocumentRef(docRef)
-        .setClusterId(edge.getToClusterId())
-        .setCurrentNodeId(edge.getToNodeId())
-        .build();
-    
-    kafkaProducer.send(bridgeTopic, crossClusterStream);
+    // ... persist and publish
 }
 ```
