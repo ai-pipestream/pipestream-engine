@@ -1,6 +1,20 @@
 # Engine Processing Loop
 
+The Engine Processing Loop is the heart of the Pipestream orchestration. It manages the lifecycle of a document as it moves through a specific node in the pipeline graph, handling everything from data preparation to remote module execution and routing to subsequent nodes.
+
 ## Core Loop
+
+The core loop orchestrates the execution of a single pipeline node. It fetches the necessary configuration, prepares the document data, evaluates whether the node should be executed, calls the remote module, and finally routes the result to the next steps in the graph.
+
+### Processing Steps
+- **Node Configuration Lookup**: Retrieves the specific settings for the current node from the in-memory graph cache.
+- **Document Hydration**: Ensures the full document data is available, fetching it from the repository service if only a reference was provided.
+- **Filter Evaluation**: Checks a CEL (Common Expression Language) condition to decide if the node's logic should be applied or if the document should bypass this node.
+- **Pre-mapping Transforms**: Applies data transformations to the document before it is sent to the module.
+- **Module Execution**: Calls the remote module service via gRPC and handles the response.
+- **Post-mapping Transforms**: Applies further transformations to the output document received from the module.
+- **Metadata Update**: Records the execution history and updates stream-level information.
+- **Routing**: Determines the next nodes in the pipeline and dispatches the stream.
 
 ```java
 void processNode(PipeStream stream) {
@@ -48,9 +62,34 @@ void processNode(PipeStream stream) {
 }
 ```
 
+```mermaid
+flowchart TD
+    Start([Start processNode]) --> Config[Lookup Node Config]
+    Config --> Hydrate{Hydrate Doc?}
+    Hydrate -- Ref only --> Fetch[Fetch from Repo Service]
+    Hydrate -- Inline --> Filter{Filter CEL?}
+    Fetch --> Filter
+    Filter -- Match --> PreMap[Apply Pre-mappings]
+    Filter -- No Match --> Route[Route to Next Nodes]
+    PreMap --> Call[Call Remote Module]
+    Call --> Success{Success?}
+    Success -- No --> Error[Append Error to History]
+    Success -- Yes --> PostMap[Apply Post-mappings]
+    Error --> PostMap
+    PostMap --> Meta[Update Stream Metadata]
+    Meta --> Route
+    Route --> End([End])
+```
+
 ## Stream Metadata Updates
 
-After each hop, the engine updates:
+Metadata updates ensure that every step of the document's journey is tracked and that the stream state correctly reflects its current position and history.
+
+### Metadata Update Actions
+- **Document Replacement**: Updates the stream with the latest version of the document (the output from the node).
+- **Hop Count Increment**: Tracks the number of nodes the document has passed through.
+- **Execution History Logging**: Adds a `StepExecutionRecord` containing the node ID, timestamp, processing duration, and status.
+- **Processing Path Tracking**: Appends the current node ID to the ordered list of visited nodes.
 
 ```java
 PipeStream updateStreamMetadata(PipeStream stream, PipeDoc doc, String nodeId) {
@@ -75,7 +114,30 @@ PipeStream updateStreamMetadata(PipeStream stream, PipeDoc doc, String nodeId) {
 }
 ```
 
+```mermaid
+graph LR
+    Input[Original PipeStream] --> Builder[Stream Builder]
+    subgraph Updates [Field Updates]
+        Builder --> Doc[Set Document]
+        Builder --> Hop[Hop Count + 1]
+        Builder --> Hist[Add History Record]
+        Builder --> Path[Add Node to Path]
+    end
+    Updates --> Output[Updated PipeStream]
+```
+
 ## Routing to Next Nodes
+
+Routing manages the "fan-out" logic of the pipeline. It determines which edges to follow based on priority and conditional logic, and then chooses the appropriate transport mechanism (gRPC or Kafka) to deliver the document.
+
+### Routing Logic
+- **Edge Retrieval**: Gets all outgoing connections for the current node from the graph cache.
+- **Priority Sorting**: Ensures edges are evaluated in the defined order.
+- **Condition Evaluation**: Uses CEL to determine which edges the document qualifies for.
+- **Terminal Handling**: Finalizes the stream if no matching outgoing edges are found.
+- **Transport Selection**:
+    - **Kafka Path**: Offloads large documents to storage (S3) and sends a reference via a Kafka topic.
+    - **gRPC Path**: Sends the document directly to another engine instance, either in a different cluster or via a local recursive call.
 
 ```java
 void routeToNextNodes(PipeStream stream, PipeDoc doc) {
@@ -142,7 +204,34 @@ void routeViaTransport(PipeStream stream, PipeDoc doc, GraphEdge edge) {
 }
 ```
 
+```mermaid
+flowchart TD
+    FindEdges[Get Outgoing Edges] --> Sort[Sort by Priority]
+    Sort --> Eval{Evaluate CEL Conditions}
+    Eval --> None{Any matches?}
+    None -- No --> Terminal[Handle Terminal Node]
+    None -- Yes --> Loop[For Each Matching Edge]
+    Loop --> Transport{Transport Type?}
+    Transport -- Messaging/Kafka --> S3[Save to S3/Repo]
+    S3 --> Kafka[Send to Kafka Topic]
+    Transport -- gRPC --> Cluster{Cross Cluster?}
+    Cluster -- Yes --> Remote[Route to Remote Cluster]
+    Cluster -- No --> Local[Local processNode call]
+    Kafka --> LoopEnd[Next Edge]
+    Remote --> LoopEnd
+    Local --> LoopEnd
+    LoopEnd --> Loop
+```
+
 ## Calling Remote Modules
+
+The engine communicates with external modules (like parsers or LLMs) via gRPC. This process includes discovering healthy service instances and building a standard request structure.
+
+### Module Call Steps
+- **Service Discovery**: Queries Consul to find a healthy instance of the required module service.
+- **Availability Check**: Ensures a service instance exists; otherwise, throws an exception for retry/DLQ handling.
+- **Request Construction**: Packages the document, node configuration, and stream metadata into a `ProcessDataRequest`.
+- **gRPC Invocation**: Executes the remote call using a blocking stub with a configurable deadline/timeout.
 
 ```java
 ProcessDataResponse callModule(String nodeId, PipeDoc doc, NodeConfig config) {
@@ -177,7 +266,26 @@ ProcessDataResponse callModule(String nodeId, PipeDoc doc, NodeConfig config) {
 }
 ```
 
+```mermaid
+sequenceDiagram
+    participant E as Engine
+    participant C as Consul
+    participant M as Remote Module
+    
+    E->>C: Get healthy instance for Module ID
+    C-->>E: Service Instance (Host/Port)
+    alt Instance not found
+        E-->>E: Throw ModuleUnavailableException
+    end
+    E->>E: Build ProcessDataRequest
+    E->>M: gRPC: processData(request)
+    Note over E,M: With Timeout (Deadline)
+    M-->>E: ProcessDataResponse
+```
+
 ## Error Handling
+
+The engine employs different strategies depending on the nature of the failure to ensure robustness and observability.
 
 | Error Type | Handling |
 |------------|----------|
