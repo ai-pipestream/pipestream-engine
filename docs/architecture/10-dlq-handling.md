@@ -11,9 +11,19 @@ The Dead Letter Queue (DLQ) captures documents that fail processing after exhaus
 
 **Key distinction:** Logical failures are valid processing outcomes - the module ran successfully but couldn't process the document. Infrastructure failures indicate something is broken and may resolve with retry.
 
-## DLQ Flow
+## DLQ Ownership Model
 
-DLQ handling is split between Engine (retry) and Sidecar (DLQ publish):
+DLQ handling depends on how the document arrived at the Engine:
+
+| Arrival Path | On Failure | DLQ Published By |
+|--------------|------------|------------------|
+| **Via Sidecar (Kafka)** | Engine returns error | Sidecar (has offset context) |
+| **Via gRPC (direct)** | Engine returns error | None - error bubbles up |
+| **Via gRPC with `save_on_error=true`** | Engine returns error | Engine (persists first, then publishes) |
+
+## DLQ Flow: Kafka Path
+
+When documents arrive via Kafka, Sidecar handles DLQ publishing:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -34,10 +44,62 @@ DLQ handling is split between Engine (retry) and Sidecar (DLQ publish):
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Why Sidecar owns DLQ:**
+**Why Sidecar owns DLQ for Kafka arrivals:**
 - Sidecar already has Kafka client
 - Sidecar knows original topic/offset for replay context
-- Engine stays pure gRPC (no Kafka dependency)
+- Engine stays focused on processing
+
+## DLQ Flow: gRPC Path with save_on_error
+
+For expensive nodes in gRPC chains, enable `save_on_error` to capture failures:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│   Caller (Engine/Intake)           Engine (with save_on_error)  │
+│   ┌──────────────────┐             ┌──────────────────────┐     │
+│   │ Call Engine      │   gRPC      │ Call module          │     │
+│   │                  │────────────►│ with retries         │     │
+│   │                  │             │                      │     │
+│   │                  │             │ If failure:          │     │
+│   │                  │             │ • Persist to Repo    │     │
+│   │                  │             │ • Publish to DLQ     │     │
+│   │                  │◄────────────│ Return error         │     │
+│   │                  │             └──────────────────────┘     │
+│   │ Receives error   │                                          │
+│   │ (doc is safe     │                                          │
+│   │  in DLQ)         │                                          │
+│   └──────────────────┘                                          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Node Configuration: save_on_error
+
+Per-node option to enable DLQ for gRPC arrivals:
+
+```protobuf
+message NodeProcessingConfig {
+  // ... existing fields ...
+  
+  // If true, persist failed documents to DLQ even when reached via gRPC edge.
+  // Default: false (gRPC errors bubble up to caller)
+  // Use case: Expensive nodes where you don't want to redo upstream processing.
+  bool save_on_error = 7;
+}
+```
+
+**When to use `save_on_error=true`:**
+
+| Node Type | save_on_error | Rationale |
+|-----------|---------------|-----------|
+| Parser | `false` | Cheap to rerun from intake |
+| Chunker | `false` | Fast, just retry |
+| Embedder (GPU) | `true` | Expensive - don't redo parsing/chunking |
+| External API | `true` | Rate limited, may have side effects |
+| LLM call | `true` | Costly, slow to redo |
+
+**Frontend UX:** Checkbox "Enable failure replay for this node" with tooltip explaining that failed documents will be saved for later replay.
 
 ## Engine: Retry Logic
 
@@ -48,6 +110,7 @@ ProcessNodeResponse processNode(ProcessNodeRequest request) {
     PipeStream stream = request.getStream();
     GraphNode node = graphCache.getNode(stream.getCurrentNodeId());
     DlqConfig dlqConfig = node.getDlqConfig();
+    NodeProcessingConfig processingConfig = node.getProcessingConfig();
     
     int attempt = 0;
     Exception lastError = null;
@@ -82,7 +145,12 @@ ProcessNodeResponse processNode(ProcessNodeRequest request) {
         }
     }
     
-    // Exhausted retries - return error to caller
+    // Exhausted retries
+    if (processingConfig.getSaveOnError()) {
+        // Persist doc and publish to DLQ before returning error
+        publishToDlq(stream, lastError, attempt);
+    }
+    
     return ProcessNodeResponse.newBuilder()
         .setSuccess(false)
         .setErrorMessage(lastError.getMessage())
@@ -90,11 +158,41 @@ ProcessNodeResponse processNode(ProcessNodeRequest request) {
         .setRetryCount(attempt)
         .build();
 }
+
+void publishToDlq(PipeStream stream, Exception error, int retryCount) {
+    // Ensure doc is persisted
+    PipeDoc doc = stream.getDocument();
+    String nodeId = stream.getCurrentNodeId();
+    String accountId = stream.getMetadata().getAccountId();
+    
+    repoService.savePipeDoc(doc, nodeId, accountId);
+    
+    // Publish to DLQ
+    DlqMessage dlqMessage = DlqMessage.newBuilder()
+        .setStream(stream.toBuilder()
+            .clearDocument()
+            .setDocumentRef(DocumentReference.newBuilder()
+                .setDocId(doc.getDocId())
+                .setSourceNodeId(nodeId)
+                .setAccountId(accountId)
+                .build())
+            .build())
+        .setErrorType(error.getClass().getSimpleName())
+        .setErrorMessage(error.getMessage())
+        .setFailedAt(Timestamps.now())
+        .setFailedNodeId(nodeId)
+        .setRetryCount(retryCount)
+        // No original topic/offset for gRPC arrivals
+        .build();
+    
+    String dlqTopic = "dlq." + graphCache.getNode(nodeId).getClusterId() + "." + nodeId;
+    kafkaProducer.send(dlqTopic, dlqMessage);
+}
 ```
 
 ## Sidecar: DLQ Publishing
 
-Sidecar handles DLQ for failed Engine calls:
+Sidecar handles DLQ for failed Engine calls when documents arrive via Kafka:
 
 ```java
 void processRecord(ConsumerRecord<String, PipeStream> record) {
@@ -146,7 +244,7 @@ void sendToDlq(ConsumerRecord<String, PipeStream> record,
 
 ## DLQ Configuration
 
-Per-node DLQ settings (from issue #14):
+Per-node DLQ settings:
 
 ```protobuf
 message DlqConfig {
@@ -178,7 +276,7 @@ message DlqMessage {
   google.protobuf.Timestamp failed_at = 4;
   int32 retry_count = 5;
   
-  // Origin context for replay
+  // Origin context for replay (populated by Sidecar, empty for save_on_error)
   string failed_node_id = 6;
   string original_topic = 7;
   int32 original_partition = 8;
@@ -190,25 +288,32 @@ message DlqMessage {
 
 ```mermaid
 flowchart TD
-    Start[Sidecar: Consume from Kafka] --> Hydrate[Hydrate Document]
-    Hydrate --> Call[Call Engine.ProcessNode]
+    Start[Receive Document] --> Source{Arrival Path?}
     
-    Call --> EngineRetry{Engine: Call Module}
-    EngineRetry -- Success --> Route[Route to Next Nodes]
-    Route --> OK[Return Success to Sidecar]
+    Source -- Kafka --> SidecarConsume[Sidecar: Consume from Kafka]
+    Source -- gRPC --> DirectCall[Engine: Receive gRPC]
     
-    EngineRetry -- "Logical Fail" --> Log[Log Error in History]
+    SidecarConsume --> Hydrate[Hydrate Document]
+    Hydrate --> CallEngine[Call Engine.ProcessNode]
+    
+    DirectCall --> EngineProcess[Process with Retries]
+    CallEngine --> EngineProcess
+    
+    EngineProcess -- Success --> Route[Route to Next Nodes]
+    EngineProcess -- "Logical Fail" --> Log[Log Error in History]
     Log --> Route
     
-    EngineRetry -- "Infra Fail" --> Retry{Retry < Max?}
-    Retry -- Yes --> Wait[Backoff Wait]
-    Wait --> EngineRetry
+    EngineProcess -- "Infra Fail, Retries Exhausted" --> CheckSaveOnError{save_on_error?}
     
-    Retry -- No --> Error[Return Error to Sidecar]
+    CheckSaveOnError -- Yes --> EngineDLQ[Engine: Persist + Publish DLQ]
+    EngineDLQ --> ReturnError[Return Error]
     
-    OK --> Commit[Sidecar: Commit Offset]
-    Error --> DLQ[Sidecar: Publish to DLQ]
-    DLQ --> Commit
+    CheckSaveOnError -- No --> ReturnError
+    
+    ReturnError --> WhoHandles{Who called?}
+    WhoHandles -- Sidecar --> SidecarDLQ[Sidecar: Publish DLQ]
+    SidecarDLQ --> Commit[Commit Offset]
+    WhoHandles -- "gRPC (upstream)" --> BubbleUp[Error Bubbles Up]
 ```
 
 ## Node-Specific DLQ Topics
@@ -245,17 +350,29 @@ sequenceDiagram
     E-->>S: Success
 ```
 
-## What About gRPC Edges?
+## gRPC Checkpointing Strategy
 
-DLQ is a Kafka concept. For gRPC edges:
+For pure gRPC chains without `save_on_error`:
 
-| Scenario | Behavior |
-|----------|----------|
-| Module fails (infra) | Engine retries, then returns error to caller |
-| Caller is another Engine | Error propagates up the call chain |
-| No DLQ | Errors bubble up synchronously |
+| Scenario | Recovery Strategy |
+|----------|-------------------|
+| Error in gRPC chain | Replay from last Kafka checkpoint (upstream) |
+| No Kafka in pipeline | Replay from intake |
 
-This is intentional - gRPC edges are for fast, synchronous paths where the caller wants immediate feedback, not eventual consistency.
+**Best practice:** Place Kafka edges before expensive nodes to create natural checkpoints:
+
+```mermaid
+graph LR
+    Intake --> Parser
+    Parser --> |Kafka| Chunker
+    Chunker --> |gRPC| Embedder[Embedder<br/>save_on_error=true]
+    Embedder --> |gRPC| Sink
+```
+
+In this example:
+- Kafka edge before Chunker = checkpoint
+- Embedder has `save_on_error=true` for GPU cost protection
+- If Sink fails, replay from Chunker (or Embedder's DLQ if it failed)
 
 ## Monitoring
 
@@ -267,3 +384,4 @@ Key metrics to track:
 | `dlq_messages_by_node` | > 10/min for any node |
 | `retry_count_histogram` | High retry rates before success |
 | `dlq_age_seconds` | Messages sitting > 1 hour |
+| `save_on_error_dlq_count` | Track gRPC-path DLQ usage |
