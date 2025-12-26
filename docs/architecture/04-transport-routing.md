@@ -132,8 +132,8 @@ List<GraphEdge> resolveMatchingEdges(String nodeId, PipeDoc doc) {
             continue;
         }
         
-        // 2. Evaluate pre-compiled CEL condition
-        CelProgram program = graphCache.getCompiledCondition(edge.getEdgeId());
+        // 2. Evaluate pre-compiled CEL condition (keyed with "edge:" prefix)
+        CelProgram program = graphCache.getCompiledCondition("edge:" + edge.getEdgeId());
         if (celEvaluator.evaluate(program, doc)) {
             matching.add(edge);
         }
