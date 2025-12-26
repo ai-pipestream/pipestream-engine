@@ -20,8 +20,10 @@ message NodeProcessingConfig {
   Intent intent = 4;
   google.protobuf.Any node_config = 5;
   
-  // Proposed (Issue #14): CEL filter to skip node processing
-  // optional string filter_condition = 6;
+  // CEL expression to filter documents before processing.
+  // If evaluates to false, skip this node and route directly to next nodes.
+  // Variable: `doc` (the PipeDoc)
+  optional string filter_condition = 6;
 }
 ```
 
@@ -51,7 +53,7 @@ message ProcessingMapping {
 enum MappingType {
   MAPPING_TYPE_UNSPECIFIED = 0;
   MAPPING_TYPE_DIRECT = 1;      // Direct field-to-field copy
-  MAPPING_TYPE_TRANSFORM = 2;   // Apply transformation function
+  MAPPING_TYPE_TRANSFORM = 2;   // Apply CEL transformation
   MAPPING_TYPE_AGGREGATE = 3;   // Combine multiple sources into one target
   MAPPING_TYPE_SPLIT = 4;       // Split one source into multiple targets
 }
@@ -61,12 +63,11 @@ enum MappingType {
 
 ```protobuf
 message TransformConfig {
-  // Current: Named transformation rule
-  string rule_name = 1;
-  optional google.protobuf.Struct params = 2;
-  
-  // Proposed (Issue #14): CEL expression for flexible transforms
-  // string cel_expression = 3;
+  // CEL expression that returns the transformed value.
+  // Variables available:
+  //   - `value`: The source field value being transformed
+  //   - `doc`: The full PipeDoc (for context-aware transforms)
+  string cel_expression = 3;
 }
 ```
 
@@ -75,7 +76,7 @@ message TransformConfig {
 | Type | Sources | Targets | Use Case |
 |------|---------|---------|----------|
 | **DIRECT** | 1 | 1 | Copy field as-is |
-| **TRANSFORM** | 1 | 1 | Apply function (uppercase, trim, etc.) |
+| **TRANSFORM** | 1 | 1 | Apply CEL expression |
 | **AGGREGATE** | N | 1 | Combine fields (concatenate, sum) |
 | **SPLIT** | 1 | N | Split field by delimiter |
 
@@ -97,14 +98,14 @@ PipeDoc applyMappings(PipeDoc doc, List<ProcessingMapping> mappings) {
                 break;
                 
             case MAPPING_TYPE_TRANSFORM:
-                // Apply transformation rule
+                // Apply CEL transformation
+                CelProgram program = graphCache.getCompiledCondition(
+                    "mapping:" + mapping.getMappingId());
                 Object sourceValue = FieldGetter.getField(doc, mapping.getSourceFieldPaths(0));
-                TransformConfig config = mapping.getTransformConfig();
-                result = transformRegistry.apply(
-                    config.getRuleName(), 
-                    sourceValue, 
-                    config.getParams()
-                );
+                result = celEvaluator.evaluate(program, Map.of(
+                    "value", sourceValue,
+                    "doc", doc
+                ));
                 break;
                 
             case MAPPING_TYPE_AGGREGATE:
@@ -139,18 +140,16 @@ PipeDoc applyMappings(PipeDoc doc, List<ProcessingMapping> mappings) {
 }
 ```
 
-## Node Filtering (Proposed)
+## Node Filtering
 
-> **Note:** Filter conditions are proposed in Issue #14 and not yet in the proto.
-
-When implemented, filtering will use CEL to skip nodes entirely:
+Node filtering uses CEL to skip nodes entirely when documents don't match criteria:
 
 ```java
 void processNode(PipeStream stream, PipeDoc doc) {
     GraphNode node = graphCache.getNode(stream.getCurrentNodeId());
     NodeProcessingConfig config = node.getProcessingConfig();
     
-    // Check filter condition (proposed)
+    // Check filter condition
     if (config.hasFilterCondition()) {
         CelProgram program = graphCache.getCompiledCondition("node:" + node.getNodeId());
         if (!celEvaluator.evaluate(program, doc)) {
@@ -177,9 +176,9 @@ void processNode(PipeStream stream, PipeDoc doc) {
 
 ## Common Expression Language (CEL)
 
-Pipestream uses CEL for filtering and conditional routing because it is fast, type-safe, and side-effect free.
+Pipestream uses CEL for filtering and transformations because it is fast, type-safe, and side-effect free.
 
-### Filter Examples (Proposed)
+### Filter Examples
 
 ```cel
 // Only process PDFs
@@ -190,21 +189,34 @@ has(doc.parsed_metadata) && size(doc.parsed_metadata) > 0
 
 // Skip small documents
 doc.blob_bag.blob.size_bytes > 1000
+
+// Process only English documents
+doc.search_metadata.language == "en"
+
+// Has specific tag
+"legal" in doc.search_metadata.tags.tag_data
 ```
 
-### Transform Examples (Proposed Issue #14)
-
-When `cel_expression` is added to TransformConfig:
+### Transform Examples
 
 ```cel
 // Normalize title to uppercase
-doc.parsed_metadata["tika"].data.title.upperAscii()
+value.upperAscii()
 
-// Conditional transformation
+// Trim whitespace
+value.trim()
+
+// Extract substring
+value.substring(0, 100)
+
+// Conditional default
+value.size() > 0 ? value : "untitled"
+
+// Context-aware transform using full doc
 doc.search_metadata.language == "en" ? value : translate(value, "en")
 
-// Extract and format
-value.trim().substring(0, 100)
+// Combine multiple operations
+value.trim().lowerAscii()
 ```
 
 ### CEL Performance
@@ -234,21 +246,56 @@ flowchart LR
     end
 ```
 
-## Built-in Transform Rules
+## Mapping Compilation
 
-The transform registry provides common transformations:
+All CEL expressions are pre-compiled during graph cache rebuild for optimal performance:
 
-| Rule Name | Description | Params |
-|-----------|-------------|--------|
-| `uppercase` | Convert to uppercase | - |
-| `lowercase` | Convert to lowercase | - |
-| `trim` | Remove leading/trailing whitespace | - |
-| `substring` | Extract substring | `start`, `end` |
-| `replace` | Replace text | `pattern`, `replacement` |
-| `date_format` | Format date string | `input_format`, `output_format` |
-| `default` | Use default if null | `default_value` |
+```java
+// In GraphCache.rebuild()
+for (GraphNode node : newGraph.getNodesList()) {
+    NodeProcessingConfig config = node.getProcessingConfig();
+    
+    // Compile node filter
+    if (config.hasFilterCondition()) {
+        newConditions.put("node:" + node.getNodeId(),
+            celCompiler.compile(config.getFilterCondition()));
+    }
+    
+    // Compile mapping transforms
+    compileMappings(config.getPreMappingsList(), newConditions);
+    compileMappings(config.getPostMappingsList(), newConditions);
+}
 
-### Example Transform Configuration
+void compileMappings(List<ProcessingMapping> mappings, Map<String, CelProgram> conditions) {
+    for (ProcessingMapping mapping : mappings) {
+        if (mapping.getMappingType() == MAPPING_TYPE_TRANSFORM) {
+            conditions.put("mapping:" + mapping.getMappingId(),
+                celCompiler.compile(mapping.getTransformConfig().getCelExpression()));
+        }
+    }
+}
+```
+
+### CEL Key Prefix Convention
+
+| Prefix | Usage |
+|--------|-------|
+| `edge:` | Edge routing conditions |
+| `node:` | Node filter conditions |
+| `mapping:` | Mapping transform expressions |
+
+## Example Configurations
+
+### Filter: Only Process PDFs
+
+```json
+{
+  "node_id": "pdf-parser",
+  "filter_condition": "has(doc.blob_bag.blob) && doc.blob_bag.blob.mime_type == 'application/pdf'"
+}
+```
+
+### Transform: Normalize Title
 
 ```json
 {
@@ -257,38 +304,39 @@ The transform registry provides common transformations:
   "target_field_paths": ["search_metadata.title"],
   "mapping_type": "MAPPING_TYPE_TRANSFORM",
   "transform_config": {
-    "rule_name": "trim"
+    "cel_expression": "value.trim()"
   }
 }
 ```
 
-## Mapping Compilation
+### Aggregate: Combine Author Fields
 
-Mappings with CEL expressions (when implemented) are pre-compiled during graph cache rebuild:
-
-```java
-// In GraphCache.rebuild()
-for (GraphNode node : newGraph.getNodesList()) {
-    NodeProcessingConfig config = node.getProcessingConfig();
-    
-    // Compile node filter (proposed)
-    if (config.hasFilterCondition()) {
-        newConditions.put("node:" + node.getNodeId(),
-            celCompiler.compile(config.getFilterCondition()));
-    }
-    
-    // Compile mapping transforms (when CEL is added)
-    for (ProcessingMapping mapping : config.getPreMappingsList()) {
-        if (mapping.hasTransformConfig() && 
-            mapping.getTransformConfig().hasCelExpression()) {
-            newConditions.put("mapping:" + mapping.getMappingId(),
-                celCompiler.compile(mapping.getTransformConfig().getCelExpression()));
-        }
-    }
+```json
+{
+  "mapping_id": "combine-authors",
+  "source_field_paths": [
+    "parsed_metadata.tika.data.creator",
+    "parsed_metadata.tika.data.author"
+  ],
+  "target_field_paths": ["search_metadata.author"],
+  "mapping_type": "MAPPING_TYPE_AGGREGATE",
+  "aggregate_config": {
+    "aggregation_type": "AGGREGATION_TYPE_CONCATENATE",
+    "delimiter": ", "
+  }
 }
 ```
 
-Key prefix convention:
-- `edge:` - Edge routing conditions
-- `node:` - Node filter conditions  
-- `mapping:` - Mapping transform expressions
+### Split: Parse Path Segments
+
+```json
+{
+  "mapping_id": "split-path",
+  "source_field_paths": ["search_metadata.source_path"],
+  "target_field_paths": ["search_metadata.source_path_segments"],
+  "mapping_type": "MAPPING_TYPE_SPLIT",
+  "split_config": {
+    "delimiter": "/"
+  }
+}
+```
