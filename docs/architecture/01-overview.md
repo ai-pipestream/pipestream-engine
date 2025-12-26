@@ -4,44 +4,72 @@
 
 The PipeStream Engine is the central orchestration service that routes documents through processing pipelines. It is a **pure gRPC service** that:
 
-- Receives documents from Intake, other engines, or Kafka sidecars
+- Receives documents via `IntakeHandoff` (from Intake services) or `ProcessNode` (from Sidecars/other Engines)
 - Determines which processing modules to invoke
 - Manages the flow through the pipeline graph
-- Handles failures and dead-letter queuing
+- Retries on infrastructure failures, returns errors to callers
 
 ## Design Principles
 
-### 1. Engine is Pure gRPC
+### 1. Engine is Pure gRPC (Input)
 
-The engine doesn't know Kafka exists. All inputs arrive via gRPC:
+The engine doesn't consume from Kafka. All inputs arrive via gRPC:
 
 ```mermaid
 graph LR
-    Intake[Intake] -- gRPC --> Engine[ProcessNodeRequest]
-    OtherEngine[Other Engine] -- gRPC --> Engine
-    Sidecar[Kafka Sidecar] -- gRPC --> Engine
+    Intake[Intake Service] -- "IntakeHandoff gRPC" --> Engine
+    OtherEngine[Other Engine] -- "ProcessNode gRPC" --> Engine
+    Sidecar[Kafka Sidecar] -- "IntakeHandoff / ProcessNode gRPC" --> Engine
     
-    subgraph EngineSees [Engine Sees]
+    subgraph EngineSees [Engine Sees Only gRPC]
         Engine
     end
 ```
 
-### 2. Sidecar Handles Kafka Complexity
+Engine can publish to Kafka for outbound routing - publishing is simple. The complexity is in consuming (leases, offsets, rebalancing) which Sidecar handles.
+
+### 2. Dual Intake Paths
+
+Documents enter the pipeline two ways:
+
+| Path | Flow | Use Case |
+|------|------|----------|
+| **Repository Path** | Intake → Repo (stores, publishes to `intake.{datasource_id}`) → Sidecar → Engine | Large files, async, replay needed |
+| **Direct Path** | Intake → Engine.IntakeHandoff (gRPC) | Small docs, sync response needed |
+
+```mermaid
+graph LR
+    subgraph IntakeServices [Intake Services]
+        CI[Connector Intake]
+        API[API Intake]
+    end
+    
+    CI --> |large/async| Repo[(Repository)]
+    CI --> |small/sync| Engine
+    API --> |large/async| Repo
+    API --> |small/sync| Engine
+    
+    Repo --> |intake.datasource_id| Kafka[[Kafka]]
+    Kafka --> Sidecar
+    Sidecar --> |gRPC| Engine
+```
+
+### 3. Sidecar Handles Kafka Consumption
 
 ```mermaid
 graph LR
     subgraph ComputeTask [Compute Task]
-        Consul["Consul Agent<br/>• Health check<br/>• Service reg"]
-        Sidecar["Kafka Sidecar<br/>• Lease mgmt<br/>• Consume<br/>• Hydrate S3<br/>• Commit offset"]
-        Engine["Engine<br/>• Pure gRPC<br/>• Stateless<br/>• Routes/maps<br/>• Calls modules"]
+        Consul[\"Consul Agent<br/>• Health check<br/>• Service reg\"]
+        Sidecar[\"Kafka Sidecar<br/>• Lease mgmt<br/>• Consume intake + node topics<br/>• Hydrate<br/>• DLQ publish on failure\"]
+        Engine[\"Engine<br/>• Pure gRPC input<br/>• Stateless<br/>• Routes/maps<br/>• Calls modules<br/>• Kafka publish for routing\"]
 
         Sidecar <--> Consul
         Sidecar -- gRPC --> Engine
-        Engine -- Commit --> Sidecar
+        Engine -- Response --> Sidecar
     end
 ```
 
-### 3. Modules are Stateless Transformers
+### 4. Modules are Stateless Transformers
 
 Modules know nothing about:
 - The graph topology
@@ -52,7 +80,7 @@ Modules know nothing about:
 
 They simply: `PipeDoc in → transform → PipeDoc out`
 
-### 4. Nodes are Logical Constructs
+### 5. Nodes are Logical Constructs
 
 ```mermaid
 graph TD
@@ -78,7 +106,7 @@ graph TD
 %% chunker-xyz-789-ghi
 ```
 
-### 5. One Transport Per Edge, Multiple Edges per Node
+### 6. One Transport Per Edge, Multiple Edges per Node
 
 | Transport | Use Case | Characteristics |
 |-----------|----------|------------------|
@@ -106,11 +134,11 @@ No mixing - each edge chooses one transport.
 
 ```mermaid
 flowchart TD
-    Start([Receive PipeStream gRPC]) --> Hydrate1["Hydrate Level 1: document_ref -> PipeDoc"]
+    Start([Receive PipeStream gRPC]) --> Hydrate1[\"Hydrate Level 1: document_ref -> PipeDoc\"]
     Hydrate1 --> Filter{Filter CEL}
     Filter -- false --> End([End])
     Filter -- true --> PreMap[Pre-mapping CEL transforms]
-    PreMap --> Hydrate2["Hydrate Level 2: storage_ref -> bytes"]
+    PreMap --> Hydrate2[\"Hydrate Level 2: storage_ref -> bytes\"]
     Hydrate2 --> CallModule[Call Module gRPC]
     CallModule --> PostMap[Post-mapping CEL transforms]
     PostMap --> Edges{For each edge}
@@ -127,7 +155,7 @@ flowchart TD
 
 ## Hydration Responsibilities
 
-Both the Engine and Kafka Sidecar can perform hydration, but they have **independent strategies** and both access S3 through the **Repo Service** (never directly):
+Both the Engine and Kafka Sidecar can perform hydration, but they have **independent strategies** and both access storage through the **Repo Service** (never directly):
 
 ```mermaid
 graph TD
@@ -175,21 +203,34 @@ graph TD
 - For now, gRPC path rarely needs Level 1 hydration (2GB limit is generous)
 - Level 2 blob hydration is always Engine's responsibility
 
+## DLQ Model
+
+Dead Letter Queue handling depends on how the document arrived:
+
+| Arrival | On Failure | DLQ Behavior |
+|---------|------------|--------------|
+| **Via Sidecar (Kafka)** | Engine returns error | Sidecar publishes to DLQ (has offset context) |
+| **Via gRPC (direct)** | Engine returns error | Error bubbles up - replay from last Kafka checkpoint |
+| **Via gRPC with `save_on_error=true`** | Engine returns error | Engine persists + publishes to DLQ |
+
+The `save_on_error` node config option enables DLQ for expensive nodes in gRPC chains (e.g., GPU embedders).
+
 ## What's Embedded in Engine
 
 | Component | Purpose |
-|-----------|---------|
+|-----------|---------| 
 | **MappingService** | Apply field transformations (CEL-based) |
 | **Graph Cache** | In-memory graph with helper lookups |
 | **CEL Evaluator** | Compile and evaluate CEL expressions |
 | **Module Caller** | gRPC client pool for modules |
 | **Repo Client** | gRPC client for hydration/persistence |
+| **Kafka Producer** | For Kafka edge routing and DLQ (when save_on_error) |
 
 ## What's NOT in Engine
 
 | Component | Where It Lives |
 |-----------|----------------|
-| **Kafka Consumer** | Kafka Sidecar (separate container) |
+| **Kafka Consumer** | Kafka Sidecar (separate service) |
 | **Topic Leases** | Consul (via sidecar) |
 | **Document Storage** | Repo Service + S3 |
 | **Module Logic** | Remote Module Services |
