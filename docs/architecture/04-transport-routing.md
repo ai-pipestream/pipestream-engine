@@ -1,135 +1,120 @@
 # Transport & Routing
 
-## Overview
+Transport and routing manage how documents move between processing nodes in the Pipestream ecosystem. The engine supports two primary transport mechanisms—synchronous gRPC for low-latency flows and asynchronous Kafka for durable, replayable pipelines—allowing each connection (edge) in the graph to choose the most appropriate path.
 
-**gRPC is the primary transport.** Most document processing flows through synchronous gRPC calls:
+## Transport Strategy
 
+Pipestream adopts a hybrid transport model where gRPC handles the "fast path" of execution, while Kafka provides a "reliable path" for cross-cluster communication or heavy processing. Every edge in the pipeline graph is explicitly configured with one of these transport types.
+
+### Strategy Characteristics
+- **Unified Interface**: The Engine treats all inputs as gRPC requests; Kafka complexity is abstracted by sidecars.
+- **Granular Control**: Transport is decided at the edge level, not the node level.
+- **Performance vs. Durability**: Choose gRPC for sub-millisecond overhead; choose Kafka for guaranteed delivery and backpressure management.
+
+```mermaid
+graph LR
+    subgraph gRPCTransport [gRPC - Fast Path]
+        E1[Engine A] -- Direct gRPC --> E2[Engine B]
+    end
+
+    subgraph KafkaTransport [Kafka - Reliable Path]
+        E3[Engine A] -- Persist --> Repo[(Repo Service)]
+        E3 -- Publish --> K[[Kafka]]
+        K -- Consume --> S[Sidecar]
+        S -- gRPC --> E4[Engine B]
+    end
 ```
-Intake ──gRPC──► Engine ──gRPC──► Module ──gRPC──► Engine ──gRPC──► Module ──gRPC──► ...
-```
-
-**Kafka is for specific edges** where asynchronous, buffered, or replay capability is needed.
-
-## One Transport Per Edge
-
-Each edge in the graph chooses ONE transport - no mixing:
-
-| Transport | Flow | Use Case |
-|-----------|------|----------|
-| **gRPC** | Engine → Engine (direct) | Fast path, low latency |
-| **Kafka** | Engine → Repo → Kafka → Sidecar → Engine | Async, replayable |
 
 ## Edge Definition
 
+The `GraphEdge` defines the connection between two nodes, including the conditions under which the connection is followed and the transport mechanism used for the transfer.
+
+### Edge Configuration Fields
+- **Source and Destination**: Identifies the `from_node_id` and `to_node_id`.
+- **Cross-Cluster Routing**: Support for routing documents between different geographic or logical clusters.
+- **Routing Logic**: A CEL expression that must evaluate to `true` for the document to traverse this edge.
+- **Priority**: Determines the order of evaluation when multiple edges originate from the same node.
+- **Transport Selection**: Explicitly sets the transport to `GRPC` or `MESSAGING` (Kafka).
+
 ```protobuf
 message GraphEdge {
-  string edge_id = 1;
-  string from_node_id = 2;
-  string to_node_id = 3;
+  optional string edge_id = 1;
+  optional string from_node_id = 2;
+  optional string to_node_id = 3;
   
   // Cross-cluster routing
   optional string to_cluster_id = 4;
-  bool is_cross_cluster = 5;
+  optional bool is_cross_cluster = 5;
   
   // Routing logic (CEL)
-  string condition = 6;
-  int32 priority = 7;
+  optional string condition = 6;
+  optional int32 priority = 7;
   
   // Transport selection
-  TransportType transport_type = 8;    // GRPC or MESSAGING
-  optional string kafka_topic = 9;     // Override default if Kafka
+  optional TransportType transport_type = 8;    // GRPC or MESSAGING
+  optional string kafka_topic = 9;              // Override default if Kafka
   
   // Loop prevention
-  int32 max_hops = 10;
+  optional int32 max_hops = 10;
 }
 ```
 
 ## gRPC Transport (Fast Path)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                     gRPC FLOW (DEFAULT)                                          │
-│                                                                                  │
-│  Engine A ────────gRPC call────────► Engine B                                   │
-│      │                                    │                                      │
-│      │   PipeStream with inline PipeDoc   │                                      │
-│      │   No persistence required          │                                      │
-│      │   Immediate processing             │                                      │
-│      │                                    │                                      │
-│  Benefits:                                                                       │
-│  • Lowest latency (no Kafka hop)                                                │
-│  • No mandatory persistence                                                     │
-│  • Simple request/response                                                      │
-│  • 2GB payload limit (plenty for most docs)                                     │
-│                                                                                  │
-│  Limitations:                                                                   │
-│  • No replay capability                                                         │
-│  • Caller waits for response                                                    │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
+The gRPC transport is the default for most internal pipeline steps. It allows for high-throughput processing by passing the `PipeDoc` directly in-memory between engine instances without the overhead of intermediate storage.
+
+### gRPC Flow Details
+- **Low Latency**: Eliminates the write-to-S3 and Kafka-broker round trips.
+- **In-Memory Handoff**: The full `PipeDoc` is typically sent inline in the `PipeStream` message.
+- **Synchronous Execution**: The sending engine waits for the receiving engine to acknowledge receipt (though not necessarily completion).
+- **Size Limits**: Supports documents up to 2GB (the standard gRPC limit), which covers the vast majority of processing use cases.
+
+```mermaid
+sequenceDiagram
+    participant EA as Engine A
+    participant EB as Engine B
+    
+    EA->>EA: Evaluate Edge (Transport: gRPC)
+    EA->>EB: processNode(PipeStream + inline PipeDoc)
+    Note over EB: Stateless processing starts
+    EB-->>EA: Ack (Success)
 ```
 
-## Kafka Transport (Async/Replay Path)
+## Kafka Transport (Reliable Path)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                     KAFKA FLOW                                                   │
-│                                                                                  │
-│  Engine A                                                                        │
-│      │                                                                           │
-│      ├──► Repo.SavePipeDoc() ──► S3 (persist document)                          │
-│      │                                                                           │
-│      └──► Kafka.publish(topic, PipeStream with document_ref)                    │
-│                          │                                                       │
-│                          ▼                                                       │
-│                    ┌──────────┐                                                  │
-│                    │  Kafka   │  (10MB limit, so only document_ref)             │
-│                    └──────────┘                                                  │
-│                          │                                                       │
-│                          ▼                                                       │
-│                    ┌──────────┐                                                  │
-│                    │ Sidecar  │  (Consul lease for this topic)                  │
-│                    │ • Consume│                                                  │
-│                    │ • Hydrate│──► Repo.GetPipeDoc() ──► S3                     │
-│                    └──────────┘                                                  │
-│                          │                                                       │
-│                          ▼ localhost gRPC                                        │
-│                    ┌──────────┐                                                  │
-│                    │ Engine B │  (receives hydrated PipeStream)                 │
-│                    └──────────┘                                                  │
-│                                                                                  │
-│  Benefits:                                                                       │
-│  • Replay capability (rewind offset)                                            │
-│  • Async (fire and forget from Engine A's perspective)                          │
-│  • Natural buffering during load spikes                                         │
-│  • Cross-cluster routing                                                        │
-│                                                                                  │
-│  Limitations:                                                                   │
-│  • Higher latency (Kafka + S3 round trips)                                      │
-│  • Requires persistence                                                         │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
+Kafka transport is used when durability and decoupling are required. It is essential for cross-cluster routing, handling load spikes via buffering, and enabling the replay of specific pipeline segments.
+
+### Kafka Flow Details
+- **Persistence First**: Before publishing, the engine saves the `PipeDoc` to the Repository Service (backed by S3).
+- **Reference Passing**: The Kafka message only contains a `DocumentReference` to keep message sizes under the 10MB limit.
+- **Sidecar Orchestration**: A Kafka Sidecar manages the consumer lease, hydrates the document from the Repo Service, and delivers it to the local Engine via gRPC.
+- **Replayability**: Allows operators to "rewind" a specific node by resetting Kafka offsets.
+
+```mermaid
+sequenceDiagram
+    participant EA as Engine A
+    participant RS as Repo Service
+    participant K as Kafka
+    participant S as Sidecar
+    participant EB as Engine B
+
+    EA->>RS: savePipeDoc(PipeDoc)
+    RS->>EA: DocRef
+    EA->>K: publish(DocRef)
+    K->>S: Consume DocRef
+    S->>RS: getPipeDoc(DocRef)
+    RS->>S: PipeDoc
+    S->>EB: processNode(PipeStream + PipeDoc)
 ```
 
-## CEL Conditional Routing
+## Conditional Routing
 
-Edge conditions use [CEL (Common Expression Language)](https://github.com/google/cel-spec):
+Routing decisions are powered by the Common Expression Language (CEL), allowing for complex, type-safe logic to determine document flow based on metadata or content.
 
-```cel
-// Route PDFs to parser
-doc.search_metadata.document_type == "PDF"
-
-// Route large files to async processing
-doc.blob_bag.blob.size_bytes > 10000000
-
-// Route by source
-doc.search_metadata.source_uri.startsWith("s3://sensitive-bucket/")
-
-// Check field existence
-has(doc.search_metadata.doi)
-```
-
-### Routing Algorithm
+### Routing Logic Overview
+- **Priority Sorting**: Edges are evaluated in ascending order of their priority value.
+- **Fan-Out Support**: If multiple edges match their conditions, the document is cloned and routed to all matching paths.
+- **Fallback Logic**: Edges with no conditions act as "always match" paths (useful for default routing).
 
 ```java
 List<GraphEdge> resolveMatchingEdges(String nodeId, PipeDoc doc) {
@@ -141,13 +126,13 @@ List<GraphEdge> resolveMatchingEdges(String nodeId, PipeDoc doc) {
     List<GraphEdge> matching = new ArrayList<>();
     
     for (GraphEdge edge : edges) {
-        // Empty condition = always match
+        // 1. Empty condition = always match
         if (!edge.hasCondition()) {
             matching.add(edge);
             continue;
         }
         
-        // Evaluate CEL condition
+        // 2. Evaluate pre-compiled CEL condition
         CelProgram program = graphCache.getCompiledCondition(edge.getEdgeId());
         if (celEvaluator.evaluate(program, doc)) {
             matching.add(edge);
@@ -158,81 +143,43 @@ List<GraphEdge> resolveMatchingEdges(String nodeId, PipeDoc doc) {
 }
 ```
 
-## Routing by Transport Type
-
-```java
-void routeToNextNode(PipeStream stream, PipeDoc doc, GraphEdge edge) {
-    String accountId = stream.getMetadata().getAccountId();
-    String currentNodeId = stream.getCurrentNodeId();
-    
-    if (edge.getTransportType() == TRANSPORT_TYPE_MESSAGING) {
-        // KAFKA: Must persist, send reference
-        repoService.savePipeDoc(doc, currentNodeId, accountId);
-        
-        PipeStream dehydrated = stream.toBuilder()
-            .clearDocument()
-            .setDocumentRef(DocumentReference.newBuilder()
-                .setDocId(doc.getDocId())
-                .setSourceNodeId(currentNodeId)
-                .setAccountId(accountId)
-                .build())
-            .setCurrentNodeId(edge.getToNodeId())
-            .setHopCount(stream.getHopCount() + 1)
-            .build();
-        
-        String topic = edge.hasKafkaTopic() 
-            ? edge.getKafkaTopic()
-            : getDefaultTopic(edge.getToNodeId());
-        
-        kafkaProducer.send(topic, dehydrated);
-        
-    } else {
-        // GRPC: Pass inline, no persistence required
-        PipeStream next = stream.toBuilder()
-            .setCurrentNodeId(edge.getToNodeId())
-            .setDocument(doc)
-            .setHopCount(stream.getHopCount() + 1)
-            .build();
-        
-        if (edge.getIsCrossCluster()) {
-            engineClient.routeToCluster(edge.getToClusterId(), next);
-        } else {
-            // Direct gRPC call to engine handling that node
-            engineClient.processNode(next);
-        }
-    }
-}
+```mermaid
+flowchart TD
+    Start([Route Document]) --> Sort[Sort Edges by Priority]
+    Sort --> Loop{For each Edge}
+    Loop --> Cond{Has Condition?}
+    Cond -- No --> Match[Add to Matching List]
+    Cond -- Yes --> Eval[Evaluate CEL]
+    Eval -- True --> Match
+    Eval -- False --> Next[Next Edge]
+    Match --> Next
+    Next --> Loop
+    Loop -- Done --> End([Return Matching Edges])
 ```
 
-## Topic Naming Convention
+## Infrastructure Integration
 
-```
-pipestream.{cluster-id}.{node-uuid}
+The routing system integrates directly with Kafka and Consul to manage the underlying physical infrastructure required for messaging.
 
-Examples:
-pipestream.prod-us-east.abc123-def456-parser-node
-pipestream.prod-us-east.xyz789-chunker-node
-pipestream.staging.test-embedder-node
-
-DLQ:
-dlq.{cluster-id}.{node-uuid}
-```
-
-## Graph Node Creates Topics
-
-When a node is created that has incoming Kafka edges:
+### Topic Management
+- **Deterministic Naming**: Topics follow the pattern `pipestream.{cluster}.{node_uuid}` for clear ownership.
+- **Automatic Provisioning**: The system creates both the main data topic and a corresponding Dead Letter Queue (DLQ) for every Kafka-enabled node.
+- **Service Discovery**: Node-to-topic mappings are registered in Consul, allowing Sidecars to dynamically discover which topics they should consume.
 
 ```java
 void onNodeCreated(GraphNode node) {
     if (hasIncomingKafkaEdges(node)) {
         String topicName = "pipestream." + node.getClusterId() + "." + node.getNodeId();
+        
+        // 1. Create main processing topic
         kafkaAdmin.createTopic(topicName, partitions, replicationFactor);
         
+        // 2. Create Dead Letter Queue
         String dlqTopic = "dlq." + node.getClusterId() + "." + node.getNodeId();
         kafkaAdmin.createTopic(dlqTopic, partitions, replicationFactor);
         
-        // Register in Consul for sidecar lease distribution
-        consul.kvPut("pipestream/topics/" + node.getNodeId(), "");
+        // 3. Register in Consul for sidecar lease distribution
+        consul.kvPut("pipestream/topics/" + node.getNodeId(), topicName);
     }
 }
 ```
