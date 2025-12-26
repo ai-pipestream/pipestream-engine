@@ -1,0 +1,205 @@
+plugins {
+    alias(libs.plugins.java)
+    alias(libs.plugins.quarkus)
+    alias(libs.plugins.maven.publish)
+    id 'signing'
+    alias(libs.plugins.nmcp.single)
+    alias(libs.plugins.axion.release)
+    alias(libs.plugins.proto.toolchain)
+}
+
+def pipestreamBomVersion = findProperty('pipestreamBomVersion') ?: '0.7.10'
+
+// Axion-release configuration for automatic versioning
+scmVersion {
+    tag {
+        prefix = 'v'
+        initialVersion { config, position -> '0.0.1' }
+    }
+    checks {
+        uncommittedChanges = false
+        aheadOfRemote = false
+        snapshotDependencies = false
+    }
+}
+
+// Proto toolchain configuration - uses git-proto-workspace mode for cross-module imports
+pipestreamProtos {
+    sourceMode = 'git-proto-workspace'
+    gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
+    gitRef = "issue-14-protobuf-updates"
+    generateMutiny = true
+    generateDescriptors = true
+
+    modules {
+        register("common")
+        register("engine")
+        register("config")
+        register("pipeline-module")
+        register("repo")
+    }
+}
+
+dependencies {
+    implementation 'io.quarkus:quarkus-container-image-docker'
+    // Import pipestream BOM to align all managed versions
+    implementation platform("ai.pipestream:pipestream-bom:${pipestreamBomVersion}")
+    // Import Amazon Services BOM for S3 (if needed later)
+    implementation platform("io.quarkus.platform:quarkus-amazon-services-bom:${quarkusPlatformVersion}")
+
+    // Core Quarkus dependencies
+    implementation 'io.quarkus:quarkus-arc'
+    implementation 'io.quarkus:quarkus-grpc'
+    implementation 'io.quarkus:quarkus-rest'
+    implementation 'io.quarkus:quarkus-rest-jackson'
+    implementation 'io.grpc:grpc-services'
+    implementation 'io.quarkus:quarkus-smallrye-health'
+    implementation 'io.quarkus:quarkus-smallrye-openapi'
+    implementation 'io.quarkus:quarkus-container-image-docker'
+
+    // Kafka (for publishing - engine doesn't consume)
+    implementation 'io.quarkus:quarkus-messaging-kafka'
+    implementation 'ai.pipestream:quarkus-apicurio-registry-protobuf'
+
+    // Service discovery and registration
+    implementation 'io.quarkus:quarkus-smallrye-stork'
+    implementation 'io.smallrye.stork:stork-service-discovery-consul'
+    implementation 'io.smallrye.reactive:smallrye-mutiny-vertx-consul-client'
+
+    // Pipestream platform libraries
+    implementation 'ai.pipestream:pipestream-quarkus-devservices'
+    implementation 'ai.pipestream:quarkus-dynamic-grpc'
+    implementation 'ai.pipestream:pipestream-service-registration'
+
+    // CEL evaluation
+    implementation 'dev.cel:cel:0.11.1'
+
+    // Testing
+    testImplementation 'ai.pipestream:pipestream-wiremock-server'
+    testImplementation 'io.quarkus:quarkus-junit5'
+    testImplementation 'io.quarkus:quarkus-junit5-mockito'
+    testImplementation 'io.quarkus:quarkus-test-vertx'
+    testImplementation 'io.rest-assured:rest-assured'
+
+    // Utilities
+    implementation libs.commons.lang3
+
+    // Micrometer for metrics
+    implementation 'io.quarkus:quarkus-micrometer'
+    implementation 'io.quarkus:quarkus-micrometer-registry-prometheus'
+
+    // OpenTelemetry for tracing
+    implementation 'io.quarkus:quarkus-opentelemetry'
+
+    runtimeOnly libs.quarkus.logging.manager
+}
+
+group = 'ai.pipestream'
+version = "${scmVersion.version}"
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+test {
+    maxHeapSize = "10g"
+    systemProperty "java.util.logging.manager", "org.jboss.logmanager.LogManager"
+
+    // Required for JDK 24+ with jboss-threads
+    jvmArgs '--add-opens', 'java.base/java.lang=ALL-UNNAMED'
+}
+
+compileJava {
+    options.encoding = 'UTF-8'
+    options.compilerArgs << '-parameters'
+}
+
+compileTestJava {
+    options.encoding = 'UTF-8'
+}
+
+// Publishing configuration
+publishing {
+    publications {
+        maven(MavenPublication) { publication ->
+            from components.java
+            artifact(file("${buildDir}/quarkus-app/quarkus-run.jar")) { artifact ->
+                artifact.classifier = 'runner'
+                artifact.builtBy tasks.named('quarkusBuild')
+            }
+            pom { pom ->
+                name.set('Pipestream Engine')
+                description.set('Central orchestration service that routes documents through processing pipelines')
+                url.set('https://github.com/ai-pipestream/pipestream-engine')
+
+                licenses {
+                    license {
+                        name.set('MIT License')
+                        url.set('https://www.opensource.org/licenses/MIT')
+                    }
+                }
+
+                developers {
+                    developer {
+                        id.set('krickert')
+                        email.set('krickert@pipestream.ai')
+                        name.set('Pipeline Engine Team')
+                    }
+                }
+
+                scm {
+                    connection.set('scm:git:git://github.com/ai-pipestream/pipestream-engine.git')
+                    developerConnection.set('scm:git:ssh://github.com/ai-pipestream/pipestream-engine.git')
+                    url.set('https://github.com/ai-pipestream/pipestream-engine')
+                }
+            }
+        }
+    }
+
+    repositories {
+        // Publish to Maven Local for development
+        mavenLocal()
+
+        // Publish to GitHub Packages
+        if (System.getenv("GITHUB_ACTOR") != null) {
+            maven {
+                name = "GitHubPackages"
+                url = uri("https://maven.pkg.github.com/ai-pipestream/pipestream-engine")
+                credentials {
+                    username = System.getenv("GITHUB_ACTOR")
+                    password = System.getenv("GITHUB_TOKEN")
+                }
+            }
+        }
+    }
+}
+
+// GPG Signing
+signing {
+    def signingKey = System.getenv("GPG_PRIVATE_KEY")
+    def signingPassword = System.getenv("GPG_PASSPHRASE")
+
+    if (signingKey && signingPassword) {
+        useInMemoryPgpKeys(signingKey, signingPassword)
+        sign publishing.publications.maven
+    }
+}
+
+// Ensure signing tasks run before NMCP publication
+afterEvaluate {
+    tasks.matching { it.name.startsWith("nmcpZipAllPublications") || it.name.startsWith("nmcpPublishAllPublicationsToCentralPortal") }
+        .configureEach { nmcpTask ->
+            nmcpTask.dependsOn(tasks.withType(Sign))
+        }
+}
+
+// Maven Central publishing via NMCP
+nmcp {
+    publishAllPublicationsToCentralPortal {
+        username = providers.environmentVariable("MAVEN_CENTRAL_USERNAME")
+        password = providers.environmentVariable("MAVEN_CENTRAL_PASSWORD")
+        publishingType = "AUTOMATIC"
+    }
+}
+
