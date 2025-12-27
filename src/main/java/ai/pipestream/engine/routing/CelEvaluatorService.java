@@ -24,13 +24,21 @@ import org.jboss.logging.Logger;
 @ApplicationScoped
 public class CelEvaluatorService {
 
+    /** Logger for this service class. */
     private static final Logger LOG = Logger.getLogger(CelEvaluatorService.class);
-    
+
+    /** The CEL (Common Expression Language) environment instance. */
     private Cel cel;
-    
-    // Cache for compiled scripts: "condition_string" -> CompiledAST
+
+    /** Cache for compiled CEL scripts to improve performance. Maps condition string to compiled AST. */
     private final Map<String, CelAbstractSyntaxTree> scriptCache = new ConcurrentHashMap<>();
 
+    /**
+     * Initializes the CEL environment after dependency injection.
+     * <p>
+     * Sets up the CEL factory with protobuf type support for PipeDoc and PipeStream,
+     * enabling evaluation of conditions against document and stream data.
+     */
     @PostConstruct
     void init() {
         try {
@@ -51,10 +59,15 @@ public class CelEvaluatorService {
 
     /**
      * Evaluates a boolean condition against a document and stream context.
-     * 
-     * @param condition The CEL expression string (e.g., "document.search_metadata.language == 'en'")
-     * @param stream The current pipeline stream context
-     * @return true if the condition matches, false otherwise (or on error)
+     * <p>
+     * Compiles and caches CEL expressions for performance. The condition can reference
+     * 'document' (the PipeDoc) and 'stream' (the PipeStream) variables. Returns false
+     * on any evaluation error to ensure fail-safe routing behavior.
+     *
+     * @param condition The CEL expression string (e.g., "document.search_metadata.language == 'en'").
+     *                  If null or empty, returns true (always match).
+     * @param stream The current pipeline stream context containing document and metadata
+     * @return true if the condition matches, false otherwise (or on evaluation error)
      */
     public boolean evaluate(String condition, PipeStream stream) {
         if (condition == null || condition.isBlank()) {
@@ -86,6 +99,17 @@ public class CelEvaluatorService {
         }
     }
 
+    /**
+     * Compiles a CEL expression into an abstract syntax tree.
+     * <p>
+     * Uses the pre-configured CEL environment to parse and validate the expression.
+     * Throws RuntimeException on validation errors to ensure invalid expressions
+     * are caught early rather than at evaluation time.
+     *
+     * @param expression The CEL expression string to compile
+     * @return The compiled abstract syntax tree ready for evaluation
+     * @throws RuntimeException if the expression is invalid or cannot be compiled
+     */
     private CelAbstractSyntaxTree compile(String expression) {
         try {
             return cel.compile(expression).getAst();
