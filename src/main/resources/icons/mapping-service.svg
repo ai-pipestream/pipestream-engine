@@ -1,0 +1,17 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Mapping/transformation icon with arrows and data flow -->
+  <rect x="2" y="4" width="6" height="4" rx="1" fill="#4F46E5" opacity="0.8"/>
+  <rect x="2" y="10" width="6" height="4" rx="1" fill="#4F46E5" opacity="0.8"/>
+  <rect x="2" y="16" width="6" height="4" rx="1" fill="#4F46E5" opacity="0.8"/>
+  
+  <!-- Transformation arrows -->
+  <path d="M9 6L13 6M11 4L13 6L11 8" stroke="#059669" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M9 12L13 12M11 10L13 12L11 14" stroke="#059669" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M9 18L13 18M11 16L13 18L11 20" stroke="#059669" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <!-- Output data -->
+  <rect x="16" y="8" width="6" height="8" rx="1" fill="#DC2626" opacity="0.8"/>
+  
+  <!-- Data transformation symbol in center -->
+  <circle cx="12" cy="12" r="1.5" fill="#059669"/>
+</svg>

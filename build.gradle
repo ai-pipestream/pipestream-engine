@@ -32,6 +32,7 @@ pipestreamProtos {
     generateDescriptors = true
 
     modules {
+        register("admin")
         register("common")
         register("engine")
         register("config")
@@ -94,6 +95,8 @@ dependencies {
     testImplementation 'io.quarkus:quarkus-test-hibernate-reactive-panache'
     testImplementation 'io.rest-assured:rest-assured'
     testImplementation 'org.testcontainers:postgresql'
+
+    testImplementation libs.memoryfilesystem
 
     // Utilities
     implementation libs.commons.lang3

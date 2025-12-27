@@ -34,13 +34,13 @@ public class CelEvaluatorService {
     private final Map<String, CelAbstractSyntaxTree> scriptCache = new ConcurrentHashMap<>();
 
     /**
-     * Initializes the CEL environment after dependency injection.
+     * Initializes the CEL environment.
      * <p>
      * Sets up the CEL factory with protobuf type support for PipeDoc and PipeStream,
      * enabling evaluation of conditions against document and stream data.
      */
     @PostConstruct
-    void init() {
+    public void init() {
         try {
             // Initialize CEL environment with standard library and protobuf type support
             cel = CelFactory.standardCelBuilder()
@@ -70,32 +70,43 @@ public class CelEvaluatorService {
      * @return true if the condition matches, false otherwise (or on evaluation error)
      */
     public boolean evaluate(String condition, PipeStream stream) {
-        if (condition == null || condition.isBlank()) {
-            return true; // Empty condition implies "always match"
+        Object result = evaluateValue(condition, stream);
+        if (result instanceof Boolean) {
+            return (Boolean) result;
+        } else if (result != null) {
+            LOG.warnf("CEL condition '%s' did not return a boolean: %s", condition, result);
+        }
+        return false;
+    }
+
+    /**
+     * Evaluates a CEL expression against a document and stream context and returns the raw result.
+     * <p>
+     * Compiles and caches CEL expressions for performance. The expression can reference
+     * 'document' (the PipeDoc) and 'stream' (the PipeStream) variables.
+     *
+     * @param expression The CEL expression string (e.g., "document.search_metadata.relevance_score * 100").
+     *                   If null or empty, returns null.
+     * @param stream The current pipeline stream context containing document and metadata
+     * @return The result of the evaluation, or null if expression is empty or on error
+     */
+    public Object evaluateValue(String expression, PipeStream stream) {
+        if (expression == null || expression.isBlank()) {
+            return null;
         }
 
         try {
-            CelAbstractSyntaxTree ast = scriptCache.computeIfAbsent(condition, this::compile);
-            
+            CelAbstractSyntaxTree ast = scriptCache.computeIfAbsent(expression, this::compile);
             CelRuntime.Program program = cel.createProgram(ast);
-            
+
             Map<String, Object> input = new HashMap<>();
             input.put("document", stream.getDocument());
             input.put("stream", stream);
 
-            // Execute the script
-            Object result = program.eval(input);
-            
-            if (result instanceof Boolean) {
-                return (Boolean) result;
-            } else {
-                LOG.warnf("CEL condition '%s' did not return a boolean: %s", condition, result);
-                return false;
-            }
-
+            return program.eval(input);
         } catch (Exception e) {
-            LOG.errorf("Error evaluating CEL condition '%s': %s", condition, e.getMessage());
-            return false; // Fail-safe: don't route if we can't evaluate
+            LOG.errorf("Error evaluating CEL expression '%s': %s", expression, e.getMessage());
+            return null;
         }
     }
 
