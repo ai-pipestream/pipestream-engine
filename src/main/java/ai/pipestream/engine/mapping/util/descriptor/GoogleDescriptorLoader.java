@@ -208,24 +208,16 @@ public class GoogleDescriptorLoader implements DescriptorLoader {
     private FileDescriptor tryGetWellKnownType(String fileName) {
         try {
             // Check common well-known types
-            switch (fileName) {
-                case "google/protobuf/any.proto":
-                    return com.google.protobuf.Any.getDescriptor().getFile();
-                case "google/protobuf/struct.proto":
-                    return com.google.protobuf.Struct.getDescriptor().getFile();
-                case "google/protobuf/timestamp.proto":
-                    return com.google.protobuf.Timestamp.getDescriptor().getFile();
-                case "google/protobuf/duration.proto":
-                    return com.google.protobuf.Duration.getDescriptor().getFile();
-                case "google/protobuf/empty.proto":
-                    return com.google.protobuf.Empty.getDescriptor().getFile();
-                case "google/protobuf/field_mask.proto":
-                    return com.google.protobuf.FieldMask.getDescriptor().getFile();
-                case "google/protobuf/wrappers.proto":
-                    return com.google.protobuf.StringValue.getDescriptor().getFile();
-                default:
-                    return null;
-            }
+            return switch (fileName) {
+                case "google/protobuf/any.proto" -> com.google.protobuf.Any.getDescriptor().getFile();
+                case "google/protobuf/struct.proto" -> com.google.protobuf.Struct.getDescriptor().getFile();
+                case "google/protobuf/timestamp.proto" -> com.google.protobuf.Timestamp.getDescriptor().getFile();
+                case "google/protobuf/duration.proto" -> com.google.protobuf.Duration.getDescriptor().getFile();
+                case "google/protobuf/empty.proto" -> com.google.protobuf.Empty.getDescriptor().getFile();
+                case "google/protobuf/field_mask.proto" -> com.google.protobuf.FieldMask.getDescriptor().getFile();
+                case "google/protobuf/wrappers.proto" -> com.google.protobuf.StringValue.getDescriptor().getFile();
+                default -> null;
+            };
         } catch (Exception e) {
             return null;
         }
