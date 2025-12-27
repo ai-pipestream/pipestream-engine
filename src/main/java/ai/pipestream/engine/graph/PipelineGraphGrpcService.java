@@ -103,15 +103,17 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
                     .build());
         }
 
-        return graphService.findById(id)
-            .map(entity -> {
-                if (entity == null) {
-                    return GetGraphByIdResponse.newBuilder()
-                            .setFound(false)
-                            .build();
-                }
-                return toGetByIdResponse(entity);
-            });
+        return Panache.withSession(() ->
+            graphService.findById(id)
+                .map(entity -> {
+                    if (entity == null) {
+                        return GetGraphByIdResponse.newBuilder()
+                                .setFound(false)
+                                .build();
+                    }
+                    return toGetByIdResponse(entity);
+                })
+        );
     }
 
     /**
@@ -121,15 +123,17 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
     public Uni<GetGraphByVersionResponse> getGraphByVersion(GetGraphByVersionRequest request) {
         LOG.debugf("GetGraphByVersion: graph_id=%s, version=%d", request.getGraphId(), request.getVersion());
 
-        return graphService.findByGraphIdAndVersion(request.getGraphId(), request.getVersion())
-            .map(entity -> {
-                if (entity == null) {
-                    return GetGraphByVersionResponse.newBuilder()
-                            .setFound(false)
-                            .build();
-                }
-                return toGetByVersionResponse(entity);
-            });
+        return Panache.withSession(() ->
+            graphService.findByGraphIdAndVersion(request.getGraphId(), request.getVersion())
+                .map(entity -> {
+                    if (entity == null) {
+                        return GetGraphByVersionResponse.newBuilder()
+                                .setFound(false)
+                                .build();
+                    }
+                    return toGetByVersionResponse(entity);
+                })
+        );
     }
 
     /**
@@ -139,15 +143,17 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
     public Uni<GetActiveGraphResponse> getActiveGraph(GetActiveGraphRequest request) {
         LOG.debugf("GetActiveGraph: graph_id=%s, cluster_id=%s", request.getGraphId(), request.getClusterId());
 
-        return graphService.findActive(request.getGraphId(), request.getClusterId())
-            .map(entity -> {
-                if (entity == null) {
-                    return GetActiveGraphResponse.newBuilder()
-                            .setFound(false)
-                            .build();
-                }
-                return toGetActiveResponse(entity);
-            });
+        return Panache.withSession(() ->
+            graphService.findActive(request.getGraphId(), request.getClusterId())
+                .map(entity -> {
+                    if (entity == null) {
+                        return GetActiveGraphResponse.newBuilder()
+                                .setFound(false)
+                                .build();
+                    }
+                    return toGetActiveResponse(entity);
+                })
+        );
     }
 
     // =========================================================================
@@ -161,16 +167,18 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
     public Uni<ListGraphVersionsResponse> listGraphVersions(ListGraphVersionsRequest request) {
         LOG.debugf("ListGraphVersions: graph_id=%s", request.getGraphId());
 
-        return graphService.findAllVersions(request.getGraphId())
-            .map(entities -> {
-                List<GraphVersionInfo> versions = entities.stream()
-                        .map(this::toVersionInfo)
-                        .collect(Collectors.toList());
-                return ListGraphVersionsResponse.newBuilder()
-                        .addAllVersions(versions)
-                        .setTotalCount(versions.size())
-                        .build();
-            });
+        return Panache.withSession(() ->
+            graphService.findAllVersions(request.getGraphId())
+                .map(entities -> {
+                    List<GraphVersionInfo> versions = entities.stream()
+                            .map(this::toVersionInfo)
+                            .collect(Collectors.toList());
+                    return ListGraphVersionsResponse.newBuilder()
+                            .addAllVersions(versions)
+                            .setTotalCount(versions.size())
+                            .build();
+                })
+        );
     }
 
     /**
@@ -180,16 +188,18 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
     public Uni<ListActiveGraphsByClusterResponse> listActiveGraphsByCluster(ListActiveGraphsByClusterRequest request) {
         LOG.debugf("ListActiveGraphsByCluster: cluster_id=%s", request.getClusterId());
 
-        return graphService.findActiveByCluster(request.getClusterId())
-            .map(entities -> {
-                List<GraphVersionInfo> graphs = entities.stream()
-                        .map(this::toVersionInfo)
-                        .collect(Collectors.toList());
-                return ListActiveGraphsByClusterResponse.newBuilder()
-                        .addAllGraphs(graphs)
-                        .setTotalCount(graphs.size())
-                        .build();
-            });
+        return Panache.withSession(() ->
+            graphService.findActiveByCluster(request.getClusterId())
+                .map(entities -> {
+                    List<GraphVersionInfo> graphs = entities.stream()
+                            .map(this::toVersionInfo)
+                            .collect(Collectors.toList());
+                    return ListActiveGraphsByClusterResponse.newBuilder()
+                            .addAllGraphs(graphs)
+                            .setTotalCount(graphs.size())
+                            .build();
+                })
+        );
     }
 
     // =========================================================================
@@ -203,25 +213,27 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
     public Uni<ActivateGraphResponse> activateGraph(ActivateGraphRequest request) {
         LOG.debugf("ActivateGraph: graph_id=%s, version=%d", request.getGraphId(), request.getVersion());
 
-        return graphService.findByGraphIdAndVersion(request.getGraphId(), request.getVersion())
-            .flatMap(entity -> {
-                if (entity == null) {
-                    return Uni.createFrom().item(ActivateGraphResponse.newBuilder()
-                            .setSuccess(false)
-                            .setMessage("Graph version not found: " + request.getGraphId() + " v" + request.getVersion())
-                            .build());
-                }
-                return graphService.activate(request.getGraphId(), request.getVersion())
-                    .map(v -> {
-                        // Broadcast deactivation for old version (if any) and activation for new
-                        entity.isActive = true;
-                        broadcastEvent(GraphUpdateType.GRAPH_UPDATE_TYPE_ACTIVATED, entity);
-                        return ActivateGraphResponse.newBuilder()
-                                .setSuccess(true)
-                                .setMessage("Graph activated: " + request.getGraphId() + " v" + request.getVersion())
-                                .build();
-                    });
-            });
+        return Panache.withSession(() ->
+            graphService.findByGraphIdAndVersion(request.getGraphId(), request.getVersion())
+                .flatMap(entity -> {
+                    if (entity == null) {
+                        return Uni.createFrom().item(ActivateGraphResponse.newBuilder()
+                                .setSuccess(false)
+                                .setMessage("Graph version not found: " + request.getGraphId() + " v" + request.getVersion())
+                                .build());
+                    }
+                    return graphService.activate(request.getGraphId(), request.getVersion())
+                        .map(v -> {
+                            // Broadcast deactivation for old version (if any) and activation for new
+                            entity.isActive = true;
+                            broadcastEvent(GraphUpdateType.GRAPH_UPDATE_TYPE_ACTIVATED, entity);
+                            return ActivateGraphResponse.newBuilder()
+                                    .setSuccess(true)
+                                    .setMessage("Graph activated: " + request.getGraphId() + " v" + request.getVersion())
+                                    .build();
+                        });
+                })
+        );
     }
 
     /**
@@ -231,11 +243,13 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
     public Uni<DeactivateGraphResponse> deactivateGraph(DeactivateGraphRequest request) {
         LOG.debugf("DeactivateGraph: graph_id=%s, cluster_id=%s", request.getGraphId(), request.getClusterId());
 
-        return graphService.deactivateAll(request.getGraphId(), request.getClusterId())
-            .map(count -> DeactivateGraphResponse.newBuilder()
-                    .setSuccess(true)
-                    .setDeactivatedCount(count)
-                    .build());
+        return Panache.withTransaction(() ->
+            graphService.deactivateAll(request.getGraphId(), request.getClusterId())
+                .map(count -> DeactivateGraphResponse.newBuilder()
+                        .setSuccess(true)
+                        .setDeactivatedCount(count)
+                        .build())
+        );
     }
 
     // =========================================================================
@@ -295,10 +309,12 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
     public Uni<GetMaxVersionResponse> getMaxVersion(GetMaxVersionRequest request) {
         LOG.debugf("GetMaxVersion: graph_id=%s", request.getGraphId());
 
-        return graphService.getMaxVersion(request.getGraphId())
-            .map(maxVersion -> GetMaxVersionResponse.newBuilder()
-                    .setMaxVersion(maxVersion)
-                    .build());
+        return Panache.withSession(() ->
+            graphService.getMaxVersion(request.getGraphId())
+                .map(maxVersion -> GetMaxVersionResponse.newBuilder()
+                        .setMaxVersion(maxVersion)
+                        .build())
+        );
     }
 
     // =========================================================================

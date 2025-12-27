@@ -126,6 +126,11 @@ test {
     jvmArgs '--add-opens', 'java.base/java.lang=ALL-UNNAMED'
 }
 
+// Quarkus Dev mode configuration - JVM args for JDK 24+
+quarkusDev {
+    jvmArgs = ['--add-opens', 'java.base/java.lang=ALL-UNNAMED']
+}
+
 compileJava {
     options.encoding = 'UTF-8'
     options.compilerArgs << '-parameters'
