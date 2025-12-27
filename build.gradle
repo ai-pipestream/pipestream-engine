@@ -57,6 +57,11 @@ dependencies {
     implementation 'io.quarkus:quarkus-smallrye-openapi'
     implementation 'io.quarkus:quarkus-container-image-docker'
 
+    // PostgreSQL and Hibernate Reactive Panache for graph storage
+    implementation 'io.quarkus:quarkus-hibernate-reactive-panache'
+    implementation 'io.quarkus:quarkus-reactive-pg-client'
+    implementation 'io.quarkus:quarkus-flyway'
+
     // Kafka (for publishing - engine doesn't consume)
     implementation 'io.quarkus:quarkus-messaging-kafka'
     implementation 'ai.pipestream:quarkus-apicurio-registry-protobuf'
@@ -74,12 +79,17 @@ dependencies {
     // CEL evaluation
     implementation 'dev.cel:cel:0.11.1'
 
+    // Protobuf JSON utilities for PipelineGraph serialization
+    implementation 'com.google.protobuf:protobuf-java-util'
+
     // Testing
     testImplementation 'ai.pipestream:pipestream-wiremock-server'
     testImplementation 'io.quarkus:quarkus-junit5'
     testImplementation 'io.quarkus:quarkus-junit5-mockito'
     testImplementation 'io.quarkus:quarkus-test-vertx'
+    testImplementation 'io.quarkus:quarkus-test-hibernate-reactive-panache'
     testImplementation 'io.rest-assured:rest-assured'
+    testImplementation 'org.testcontainers:postgresql'
 
     // Utilities
     implementation libs.commons.lang3
