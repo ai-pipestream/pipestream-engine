@@ -5,14 +5,12 @@ import ai.pipestream.config.v1.GraphMode;
 import ai.pipestream.config.v1.PipelineGraph;
 import ai.pipestream.config.v1.TransportType;
 import io.quarkus.test.junit.QuarkusTest;
-import jakarta.inject.Inject;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
-import java.util.UUID;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.*;
 
 /**
  * Tests for PipelineGraphEntity serialization/deserialization.
@@ -23,18 +21,11 @@ import static org.junit.jupiter.api.Assertions.*;
 @QuarkusTest
 class PipelineGraphEntityTest {
 
-    @Inject
-    PipelineGraphService graphService;
-
-    @BeforeEach
-    void setup() {
-        // Clean up any test data
-        // Note: In a real test, you'd use @Transactional or test containers
-    }
-
     /**
      * Tests serialization of a PipelineGraph to JSON and back to protobuf.
      * Verifies that all fields are preserved during the round-trip.
+     * <p>
+     * Note: This test doesn't require database access - it only tests serialization/deserialization logic.
      */
     @Test
     void testSerializationRoundTrip() {
@@ -80,56 +71,58 @@ class PipelineGraphEntityTest {
         );
 
         // Verify entity fields
-        assertNotNull(entity.graphData);
-        assertFalse(entity.graphData.isEmpty());
-        assertEquals("test-graph-1", entity.graphId);
-        assertEquals("test-cluster", entity.clusterId);
-        assertEquals("test-account", entity.accountId);
-        assertEquals(1L, entity.version);
-        assertTrue(entity.isActive);
-        assertNotNull(entity.createdAt);
-        assertEquals("test-user", entity.createdBy);
+        assertThat(entity.graphData, is(notNullValue()));
+        assertThat(entity.graphData, is(not(emptyString())));
+        assertThat(entity.graphId, is("test-graph-1"));
+        assertThat(entity.clusterId, is("test-cluster"));
+        assertThat(entity.accountId, is("test-account"));
+        assertThat(entity.version, is(1L));
+        assertThat(entity.isActive, is(true));
+        assertThat(entity.createdAt, is(notNullValue()));
+        assertThat(entity.createdBy, is("test-user"));
 
         // Deserialize back to protobuf
         PipelineGraph deserialized = entity.toProto();
 
         // Verify all fields match
-        assertEquals(original.getGraphId(), deserialized.getGraphId());
-        assertEquals(original.getClusterId(), deserialized.getClusterId());
-        assertEquals(original.getName(), deserialized.getName());
-        assertEquals(original.getDescription(), deserialized.getDescription());
-        assertEquals(original.getVersion(), deserialized.getVersion());
-        assertEquals(original.getMode(), deserialized.getMode());
-        assertEquals(original.getNodeIdsCount(), deserialized.getNodeIdsCount());
-        assertEquals(original.getNodeIds(0), deserialized.getNodeIds(0));
-        assertEquals(original.getNodeIds(1), deserialized.getNodeIds(1));
-        assertEquals(original.getNodeIds(2), deserialized.getNodeIds(2));
-        assertEquals(original.getEdgesCount(), deserialized.getEdgesCount());
+        assertThat(deserialized.getGraphId(), is(original.getGraphId()));
+        assertThat(deserialized.getClusterId(), is(original.getClusterId()));
+        assertThat(deserialized.getName(), is(original.getName()));
+        assertThat(deserialized.getDescription(), is(original.getDescription()));
+        assertThat(deserialized.getVersion(), is(original.getVersion()));
+        assertThat(deserialized.getMode(), is(original.getMode()));
+        assertThat(deserialized.getNodeIdsCount(), is(original.getNodeIdsCount()));
+        assertThat(deserialized.getNodeIds(0), is(original.getNodeIds(0)));
+        assertThat(deserialized.getNodeIds(1), is(original.getNodeIds(1)));
+        assertThat(deserialized.getNodeIds(2), is(original.getNodeIds(2)));
+        assertThat(deserialized.getEdgesCount(), is(original.getEdgesCount()));
         
         // Verify first edge
         GraphEdge edge1 = deserialized.getEdges(0);
-        assertEquals("edge-1", edge1.getEdgeId());
-        assertEquals("node-1", edge1.getFromNodeId());
-        assertEquals("node-2", edge1.getToNodeId());
-        assertEquals(1, edge1.getPriority());
-        assertEquals(TransportType.TRANSPORT_TYPE_GRPC, edge1.getTransportType());
-        assertEquals("document.language == 'en'", edge1.getCondition());
+        assertThat(edge1.getEdgeId(), is("edge-1"));
+        assertThat(edge1.getFromNodeId(), is("node-1"));
+        assertThat(edge1.getToNodeId(), is("node-2"));
+        assertThat(edge1.getPriority(), is(1));
+        assertThat(edge1.getTransportType(), is(TransportType.TRANSPORT_TYPE_GRPC));
+        assertThat(edge1.getCondition(), is("document.language == 'en'"));
         
         // Verify second edge
         GraphEdge edge2 = deserialized.getEdges(1);
-        assertEquals("edge-2", edge2.getEdgeId());
-        assertEquals("node-2", edge2.getFromNodeId());
-        assertEquals("node-3", edge2.getToNodeId());
-        assertEquals(2, edge2.getPriority());
-        assertEquals(TransportType.TRANSPORT_TYPE_MESSAGING, edge2.getTransportType());
-        assertEquals("custom-topic", edge2.getKafkaTopic());
+        assertThat(edge2.getEdgeId(), is("edge-2"));
+        assertThat(edge2.getFromNodeId(), is("node-2"));
+        assertThat(edge2.getToNodeId(), is("node-3"));
+        assertThat(edge2.getPriority(), is(2));
+        assertThat(edge2.getTransportType(), is(TransportType.TRANSPORT_TYPE_MESSAGING));
+        assertThat(edge2.getKafkaTopic(), is("custom-topic"));
 
         // Verify timestamps
-        assertEquals(original.getCreatedAt().getSeconds(), deserialized.getCreatedAt().getSeconds());
+        assertThat(deserialized.getCreatedAt().getSeconds(), is(original.getCreatedAt().getSeconds()));
     }
 
     /**
      * Tests serialization with minimal graph (only required fields).
+     * <p>
+     * Note: This test doesn't require database access - it only tests serialization/deserialization logic.
      */
     @Test
     void testMinimalGraphSerialization() {
@@ -142,15 +135,17 @@ class PipelineGraphEntityTest {
         PipelineGraphEntity entity = PipelineGraphEntity.fromProto(minimal, "account-1", "user-1", false);
         PipelineGraph deserialized = entity.toProto();
 
-        assertEquals(minimal.getGraphId(), deserialized.getGraphId());
-        assertEquals(minimal.getClusterId(), deserialized.getClusterId());
-        assertEquals(minimal.getVersion(), deserialized.getVersion());
-        assertEquals(0, deserialized.getNodeIdsCount());
-        assertEquals(0, deserialized.getEdgesCount());
+        assertThat(deserialized.getGraphId(), is(minimal.getGraphId()));
+        assertThat(deserialized.getClusterId(), is(minimal.getClusterId()));
+        assertThat(deserialized.getVersion(), is(minimal.getVersion()));
+        assertThat(deserialized.getNodeIdsCount(), is(0));
+        assertThat(deserialized.getEdgesCount(), is(0));
     }
 
     /**
      * Tests that JSONB storage preserves complex nested structures.
+     * <p>
+     * Note: This test doesn't require database access - it only tests serialization/deserialization logic.
      */
     @Test
     void testComplexGraphSerialization() {
@@ -197,22 +192,24 @@ class PipelineGraphEntityTest {
         PipelineGraph deserialized = entity.toProto();
 
         // Verify structure
-        assertEquals(4, deserialized.getNodeIdsCount());
-        assertEquals(3, deserialized.getEdgesCount());
+        assertThat(deserialized.getNodeIdsCount(), is(4));
+        assertThat(deserialized.getEdgesCount(), is(3));
         
         // Verify cross-cluster edge
         GraphEdge crossClusterEdge = deserialized.getEdges(1);
-        assertTrue(crossClusterEdge.getIsCrossCluster());
-        assertEquals("embed-cluster", crossClusterEdge.getToClusterId());
-        assertEquals("chunks-to-embed", crossClusterEdge.getKafkaTopic());
+        assertThat(crossClusterEdge.getIsCrossCluster(), is(true));
+        assertThat(crossClusterEdge.getToClusterId(), is("embed-cluster"));
+        assertThat(crossClusterEdge.getKafkaTopic(), is("chunks-to-embed"));
         
         // Verify max hops
         GraphEdge maxHopsEdge = deserialized.getEdges(2);
-        assertEquals(10, maxHopsEdge.getMaxHops());
+        assertThat(maxHopsEdge.getMaxHops(), is(10));
     }
 
     /**
      * Tests that invalid JSON in graph_data throws appropriate exception.
+     * <p>
+     * Note: This test doesn't require database access - it only tests error handling in deserialization.
      */
     @Test
     void testInvalidJsonDeserialization() {
@@ -225,11 +222,13 @@ class PipelineGraphEntityTest {
         entity.isActive = false;
         entity.createdAt = Instant.now();
 
-        assertThrows(RuntimeException.class, entity::toProto);
+        org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, entity::toProto);
     }
 
     /**
      * Tests the fromProto factory method with all parameters.
+     * <p>
+     * Note: This test doesn't require database access - it only tests entity creation logic.
      */
     @Test
     void testFromProtoWithAllParameters() {
@@ -246,14 +245,14 @@ class PipelineGraphEntityTest {
                 true
         );
 
-        assertEquals("test-graph", entity.graphId);
-        assertEquals("cluster-1", entity.clusterId);
-        assertEquals("account-123", entity.accountId);
-        assertEquals(5L, entity.version);
-        assertEquals("admin-user", entity.createdBy);
-        assertTrue(entity.isActive);
-        assertNotNull(entity.createdAt);
-        assertNotNull(entity.graphData);
+        assertThat(entity.graphId, is("test-graph"));
+        assertThat(entity.clusterId, is("cluster-1"));
+        assertThat(entity.accountId, is("account-123"));
+        assertThat(entity.version, is(5L));
+        assertThat(entity.createdBy, is("admin-user"));
+        assertThat(entity.isActive, is(true));
+        assertThat(entity.createdAt, is(notNullValue()));
+        assertThat(entity.graphData, is(notNullValue()));
     }
 }
 

@@ -27,7 +27,7 @@ scmVersion {
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
     gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
-    gitRef = "issue-14-protobuf-updates"
+    gitRef = "main"
     generateMutiny = true
     generateDescriptors = true
 
@@ -60,7 +60,11 @@ dependencies {
     // PostgreSQL and Hibernate Reactive Panache for graph storage
     implementation 'io.quarkus:quarkus-hibernate-reactive-panache'
     implementation 'io.quarkus:quarkus-reactive-pg-client'
+
+    // JDBC driver required for Flyway (Flyway doesn't work with reactive, needs JDBC)
+    implementation 'io.quarkus:quarkus-jdbc-postgresql'
     implementation 'io.quarkus:quarkus-flyway'
+    implementation 'org.flywaydb:flyway-database-postgresql'
 
     // Kafka (for publishing - engine doesn't consume)
     implementation 'io.quarkus:quarkus-messaging-kafka'

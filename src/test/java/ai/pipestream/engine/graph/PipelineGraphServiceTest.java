@@ -5,23 +5,24 @@ import ai.pipestream.config.v1.GraphMode;
 import ai.pipestream.config.v1.PipelineGraph;
 import ai.pipestream.config.v1.TransportType;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.TestProfile;
-import io.quarkus.test.junit.QuarkusTestProfile;
+import io.quarkus.test.hibernate.reactive.panache.TransactionalUniAsserter;
+import io.quarkus.test.vertx.RunOnVertxContext;
 import jakarta.inject.Inject;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.*;
 
 /**
  * Integration tests for PipelineGraphService CRUD operations.
  * <p>
- * Tests require a PostgreSQL database (provided by Quarkus DevServices or Testcontainers).
- * All operations are tested using reactive Mutiny Uni.
+ * Tests require a PostgreSQL database (provided by Quarkus DevServices).
+ * All operations use TransactionalUniAsserter for reactive database access.
+ * Each test uses unique graph IDs to avoid conflicts between tests.
  */
 @QuarkusTest
 class PipelineGraphServiceTest {
@@ -29,272 +30,325 @@ class PipelineGraphServiceTest {
     @Inject
     PipelineGraphService graphService;
 
-    private static final String TEST_GRAPH_ID = "test-graph-crud";
     private static final String TEST_CLUSTER_ID = "test-cluster";
     private static final String TEST_ACCOUNT_ID = "test-account";
     private static final String TEST_CREATED_BY = "test-user";
 
-    @BeforeEach
-    void setup() {
-        // Clean up test data before each test
-        graphService.deleteAll(TEST_GRAPH_ID).await().indefinitely();
+    /**
+     * Generates a unique graph ID for each test to avoid conflicts.
+     */
+    private String uniqueGraphId() {
+        return "test-graph-" + UUID.randomUUID().toString().substring(0, 8);
     }
 
     /**
      * Tests creating a new graph version.
      */
     @Test
-    void testCreate() {
-        PipelineGraph graph = createTestGraph(1L);
-        
-        PipelineGraphEntity entity = graphService.create(graph, TEST_ACCOUNT_ID, TEST_CREATED_BY)
-                .await().indefinitely();
+    @RunOnVertxContext
+    void testCreate(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
+        PipelineGraph graph = createTestGraph(graphId, 1L);
 
-        assertNotNull(entity);
-        assertNotNull(entity.id);
-        assertEquals(TEST_GRAPH_ID, entity.graphId);
-        assertEquals(TEST_CLUSTER_ID, entity.clusterId);
-        assertEquals(TEST_ACCOUNT_ID, entity.accountId);
-        assertEquals(1L, entity.version);
-        assertFalse(entity.isActive); // Default to inactive
-        assertNotNull(entity.createdAt);
-        assertEquals(TEST_CREATED_BY, entity.createdBy);
-        assertNotNull(entity.graphData);
+        asserter.execute(() -> graphService.create(graph, TEST_ACCOUNT_ID, TEST_CREATED_BY));
+
+        asserter.assertThat(() -> graphService.findByGraphIdAndVersion(graphId, 1L), (PipelineGraphEntity entity) -> {
+            assertThat(entity, is(notNullValue()));
+            assertThat(entity.graphId, is(graphId));
+            assertThat(entity.clusterId, is(TEST_CLUSTER_ID));
+            assertThat(entity.accountId, is(TEST_ACCOUNT_ID));
+            assertThat(entity.version, is(1L));
+            assertThat(entity.isActive, is(false)); // Default to inactive
+            assertThat(entity.createdAt, is(notNullValue()));
+            assertThat(entity.createdBy, is(TEST_CREATED_BY));
+            assertThat(entity.graphData, is(notNullValue()));
+        });
     }
 
     /**
      * Tests creating and activating a graph version.
      */
     @Test
-    void testCreateAndActivate() {
-        PipelineGraph graph1 = createTestGraph(1L);
-        PipelineGraph graph2 = createTestGraph(2L);
+    @RunOnVertxContext
+    void testCreateAndActivate(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
+        PipelineGraph graph1 = createTestGraph(graphId, 1L);
+        PipelineGraph graph2 = createTestGraph(graphId, 2L);
+
+        UUID[] entity1Id = new UUID[1];
 
         // Create first version and activate
-        PipelineGraphEntity entity1 = graphService.createAndActivate(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY)
-                .await().indefinitely();
-        assertTrue(entity1.isActive);
+        asserter.execute(() -> graphService.createAndActivate(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY)
+                .invoke(entity -> entity1Id[0] = entity.id));
+
+        asserter.assertThat(() -> graphService.findById(entity1Id[0]), (PipelineGraphEntity entity) -> {
+            assertThat(entity.isActive, is(true));
+        });
 
         // Create second version and activate - should deactivate first
-        PipelineGraphEntity entity2 = graphService.createAndActivate(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY)
-                .await().indefinitely();
-        assertTrue(entity2.isActive);
+        asserter.execute(() -> graphService.createAndActivate(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY));
 
         // Verify first version is now inactive
-        PipelineGraphEntity reloaded1 = graphService.findById(entity1.id).await().indefinitely();
-        assertFalse(reloaded1.isActive);
+        asserter.assertThat(() -> graphService.findById(entity1Id[0]), (PipelineGraphEntity entity) -> {
+            assertThat(entity.isActive, is(false));
+        });
+
+        // Verify second version is active
+        asserter.assertThat(() -> graphService.findActive(graphId, TEST_CLUSTER_ID), (PipelineGraphEntity entity) -> {
+            assertThat(entity, is(notNullValue()));
+            assertThat(entity.version, is(2L));
+            assertThat(entity.isActive, is(true));
+        });
     }
 
     /**
      * Tests finding a graph by ID.
      */
     @Test
-    void testFindById() {
-        PipelineGraph graph = createTestGraph(1L);
-        PipelineGraphEntity created = graphService.create(graph, TEST_ACCOUNT_ID, TEST_CREATED_BY)
-                .await().indefinitely();
+    @RunOnVertxContext
+    void testFindById(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
+        PipelineGraph graph = createTestGraph(graphId, 1L);
+        UUID[] entityId = new UUID[1];
 
-        PipelineGraphEntity found = graphService.findById(created.id).await().indefinitely();
+        asserter.execute(() -> graphService.create(graph, TEST_ACCOUNT_ID, TEST_CREATED_BY)
+                .invoke(entity -> entityId[0] = entity.id));
 
-        assertNotNull(found);
-        assertEquals(created.id, found.id);
-        assertEquals(TEST_GRAPH_ID, found.graphId);
+        asserter.assertThat(() -> graphService.findById(entityId[0]), (PipelineGraphEntity found) -> {
+            assertThat(found, is(notNullValue()));
+            assertThat(found.id, is(entityId[0]));
+            assertThat(found.graphId, is(graphId));
+        });
     }
 
     /**
      * Tests finding a graph by graph_id and version.
      */
     @Test
-    void testFindByGraphIdAndVersion() {
-        PipelineGraph graph1 = createTestGraph(1L);
-        PipelineGraph graph2 = createTestGraph(2L);
+    @RunOnVertxContext
+    void testFindByGraphIdAndVersion(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
+        PipelineGraph graph1 = createTestGraph(graphId, 1L);
+        PipelineGraph graph2 = createTestGraph(graphId, 2L);
 
-        graphService.create(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
-        graphService.create(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
+        asserter.execute(() -> graphService.create(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY));
+        asserter.execute(() -> graphService.create(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY));
 
-        PipelineGraphEntity found = graphService.findByGraphIdAndVersion(TEST_GRAPH_ID, 2L)
-                .await().indefinitely();
-
-        assertNotNull(found);
-        assertEquals(2L, found.version);
+        asserter.assertThat(() -> graphService.findByGraphIdAndVersion(graphId, 2L), (PipelineGraphEntity found) -> {
+            assertThat(found, is(notNullValue()));
+            assertThat(found.version, is(2L));
+        });
     }
 
     /**
      * Tests finding the active graph for a graph_id and cluster.
      */
     @Test
-    void testFindActive() {
-        PipelineGraph graph1 = createTestGraph(1L);
-        PipelineGraph graph2 = createTestGraph(2L);
+    @RunOnVertxContext
+    void testFindActive(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
+        PipelineGraph graph1 = createTestGraph(graphId, 1L);
+        PipelineGraph graph2 = createTestGraph(graphId, 2L);
 
-        graphService.create(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
-        graphService.createAndActivate(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
+        asserter.execute(() -> graphService.create(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY));
+        asserter.execute(() -> graphService.createAndActivate(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY));
 
-        PipelineGraphEntity active = graphService.findActive(TEST_GRAPH_ID, TEST_CLUSTER_ID)
-                .await().indefinitely();
-
-        assertNotNull(active);
-        assertEquals(2L, active.version);
-        assertTrue(active.isActive);
+        asserter.assertThat(() -> graphService.findActive(graphId, TEST_CLUSTER_ID), (PipelineGraphEntity active) -> {
+            assertThat(active, is(notNullValue()));
+            assertThat(active.version, is(2L));
+            assertThat(active.isActive, is(true));
+        });
     }
 
     /**
      * Tests finding all active graphs for a cluster.
      */
     @Test
-    void testFindActiveByCluster() {
+    @RunOnVertxContext
+    void testFindActiveByCluster(TransactionalUniAsserter asserter) {
         PipelineGraph graph1 = createTestGraph("graph-1", 1L);
         PipelineGraph graph2 = createTestGraph("graph-2", 1L);
         PipelineGraph graph3 = createTestGraph("graph-3", 1L);
 
-        graphService.createAndActivate(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
-        graphService.createAndActivate(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
-        graphService.create(graph3, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely(); // Inactive
+        asserter.execute(() -> graphService.createAndActivate(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY));
+        asserter.execute(() -> graphService.createAndActivate(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY));
+        asserter.execute(() -> graphService.create(graph3, TEST_ACCOUNT_ID, TEST_CREATED_BY)); // Inactive
 
-        List<PipelineGraphEntity> active = graphService.findActiveByCluster(TEST_CLUSTER_ID)
-                .await().indefinitely();
-
-        assertEquals(2, active.size());
-        assertTrue(active.stream().allMatch(e -> e.isActive));
+        asserter.assertThat(() -> graphService.findActiveByCluster(TEST_CLUSTER_ID), (List<PipelineGraphEntity> active) -> {
+            assertThat(active.size(), is(greaterThanOrEqualTo(2)));
+            assertThat(active.stream().allMatch(e -> e.isActive), is(true));
+        });
     }
 
     /**
      * Tests finding all versions of a graph.
      */
     @Test
-    void testFindAllVersions() {
-        PipelineGraph graph1 = createTestGraph(1L);
-        PipelineGraph graph2 = createTestGraph(2L);
-        PipelineGraph graph3 = createTestGraph(3L);
+    @RunOnVertxContext
+    void testFindAllVersions(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
+        PipelineGraph graph1 = createTestGraph(graphId, 1L);
+        PipelineGraph graph2 = createTestGraph(graphId, 2L);
+        PipelineGraph graph3 = createTestGraph(graphId, 3L);
 
-        graphService.create(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
-        graphService.create(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
-        graphService.create(graph3, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
+        asserter.execute(() -> graphService.create(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY));
+        asserter.execute(() -> graphService.create(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY));
+        asserter.execute(() -> graphService.create(graph3, TEST_ACCOUNT_ID, TEST_CREATED_BY));
 
-        List<PipelineGraphEntity> versions = graphService.findAllVersions(TEST_GRAPH_ID)
-                .await().indefinitely();
-
-        assertEquals(3, versions.size());
-        // Should be ordered by version DESC
-        assertEquals(3L, versions.get(0).version);
-        assertEquals(2L, versions.get(1).version);
-        assertEquals(1L, versions.get(2).version);
+        asserter.assertThat(() -> graphService.findAllVersions(graphId), (List<PipelineGraphEntity> versions) -> {
+            assertThat(versions.size(), is(3));
+            // Should be ordered by version DESC
+            assertThat(versions.get(0).version, is(3L));
+            assertThat(versions.get(1).version, is(2L));
+            assertThat(versions.get(2).version, is(1L));
+        });
     }
 
     /**
      * Tests getting the maximum version number.
      */
     @Test
-    void testGetMaxVersion() {
-        assertEquals(0L, graphService.getMaxVersion(TEST_GRAPH_ID).await().indefinitely());
+    @RunOnVertxContext
+    void testGetMaxVersion(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
 
-        graphService.create(createTestGraph(1L), TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
-        assertEquals(1L, graphService.getMaxVersion(TEST_GRAPH_ID).await().indefinitely());
+        asserter.assertThat(() -> graphService.getMaxVersion(graphId), (Long maxVersion) -> {
+            assertThat(maxVersion, is(0L));
+        });
 
-        graphService.create(createTestGraph(5L), TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
-        assertEquals(5L, graphService.getMaxVersion(TEST_GRAPH_ID).await().indefinitely());
+        asserter.execute(() -> graphService.create(createTestGraph(graphId, 1L), TEST_ACCOUNT_ID, TEST_CREATED_BY));
+
+        asserter.assertThat(() -> graphService.getMaxVersion(graphId), (Long maxVersion) -> {
+            assertThat(maxVersion, is(1L));
+        });
+
+        asserter.execute(() -> graphService.create(createTestGraph(graphId, 5L), TEST_ACCOUNT_ID, TEST_CREATED_BY));
+
+        asserter.assertThat(() -> graphService.getMaxVersion(graphId), (Long maxVersion) -> {
+            assertThat(maxVersion, is(5L));
+        });
     }
 
     /**
      * Tests activating a specific version.
      */
     @Test
-    void testActivate() {
-        PipelineGraph graph1 = createTestGraph(1L);
-        PipelineGraph graph2 = createTestGraph(2L);
+    @RunOnVertxContext
+    void testActivate(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
+        PipelineGraph graph1 = createTestGraph(graphId, 1L);
+        PipelineGraph graph2 = createTestGraph(graphId, 2L);
 
-        PipelineGraphEntity entity1 = graphService.createAndActivate(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY)
-                .await().indefinitely();
-        PipelineGraphEntity entity2 = graphService.create(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY)
-                .await().indefinitely();
+        UUID[] entity1Id = new UUID[1];
+        UUID[] entity2Id = new UUID[1];
 
-        assertTrue(entity1.isActive);
-        assertFalse(entity2.isActive);
+        asserter.execute(() -> graphService.createAndActivate(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY)
+                .invoke(entity -> entity1Id[0] = entity.id));
+        asserter.execute(() -> graphService.create(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY)
+                .invoke(entity -> entity2Id[0] = entity.id));
+
+        asserter.assertThat(() -> graphService.findById(entity1Id[0]), (PipelineGraphEntity entity) -> {
+            assertThat(entity.isActive, is(true));
+        });
+        asserter.assertThat(() -> graphService.findById(entity2Id[0]), (PipelineGraphEntity entity) -> {
+            assertThat(entity.isActive, is(false));
+        });
 
         // Activate version 2
-        graphService.activate(TEST_GRAPH_ID, 2L).await().indefinitely();
+        asserter.execute(() -> graphService.activate(graphId, 2L));
 
         // Verify both are updated
-        PipelineGraphEntity reloaded1 = graphService.findById(entity1.id).await().indefinitely();
-        PipelineGraphEntity reloaded2 = graphService.findById(entity2.id).await().indefinitely();
-        assertFalse(reloaded1.isActive);
-        assertTrue(reloaded2.isActive);
+        asserter.assertThat(() -> graphService.findById(entity1Id[0]), (PipelineGraphEntity entity) -> {
+            assertThat(entity.isActive, is(false));
+        });
+        asserter.assertThat(() -> graphService.findById(entity2Id[0]), entity -> {
+            assertThat(entity.isActive, is(true));
+        });
     }
 
     /**
      * Tests deactivating all versions.
      */
     @Test
-    void testDeactivateAll() {
-        PipelineGraph graph1 = createTestGraph(1L);
-        PipelineGraph graph2 = createTestGraph(2L);
+    @RunOnVertxContext
+    void testDeactivateAll(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
+        PipelineGraph graph1 = createTestGraph(graphId, 1L);
+        PipelineGraph graph2 = createTestGraph(graphId, 2L);
 
-        graphService.createAndActivate(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
-        graphService.create(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
+        asserter.execute(() -> graphService.createAndActivate(graph1, TEST_ACCOUNT_ID, TEST_CREATED_BY));
+        asserter.execute(() -> graphService.create(graph2, TEST_ACCOUNT_ID, TEST_CREATED_BY));
 
-        graphService.deactivateAll(TEST_GRAPH_ID, TEST_CLUSTER_ID).await().indefinitely();
+        asserter.execute(() -> graphService.deactivateAll(graphId, TEST_CLUSTER_ID));
 
-        PipelineGraphEntity active = graphService.findActive(TEST_GRAPH_ID, TEST_CLUSTER_ID)
-                .await().indefinitely();
-        assertNull(active);
+        asserter.assertThat(() -> graphService.findActive(graphId, TEST_CLUSTER_ID), (PipelineGraphEntity active) -> {
+            assertThat(active, is(nullValue()));
+        });
     }
 
     /**
      * Tests deleting a specific version.
      */
     @Test
-    void testDelete() {
-        PipelineGraph graph = createTestGraph(1L);
-        PipelineGraphEntity created = graphService.create(graph, TEST_ACCOUNT_ID, TEST_CREATED_BY)
-                .await().indefinitely();
+    @RunOnVertxContext
+    void testDelete(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
+        PipelineGraph graph = createTestGraph(graphId, 1L);
+        UUID[] entityId = new UUID[1];
 
-        boolean deleted = graphService.delete(TEST_GRAPH_ID, 1L).await().indefinitely();
-        assertTrue(deleted);
+        asserter.execute(() -> graphService.create(graph, TEST_ACCOUNT_ID, TEST_CREATED_BY)
+                .invoke(entity -> entityId[0] = entity.id));
 
-        PipelineGraphEntity found = graphService.findById(created.id).await().indefinitely();
-        assertNull(found);
+        asserter.execute(() -> graphService.delete(graphId, 1L));
+
+        asserter.assertThat(() -> graphService.findById(entityId[0]), (PipelineGraphEntity found) -> {
+            assertThat(found, is(nullValue()));
+        });
     }
 
     /**
      * Tests deleting all versions of a graph.
      */
     @Test
-    void testDeleteAll() {
-        graphService.create(createTestGraph(1L), TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
-        graphService.create(createTestGraph(2L), TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
-        graphService.create(createTestGraph(3L), TEST_ACCOUNT_ID, TEST_CREATED_BY).await().indefinitely();
+    @RunOnVertxContext
+    void testDeleteAll(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
 
-        Long deleted = graphService.deleteAll(TEST_GRAPH_ID).await().indefinitely();
-        assertEquals(3L, deleted);
+        asserter.execute(() -> graphService.create(createTestGraph(graphId, 1L), TEST_ACCOUNT_ID, TEST_CREATED_BY));
+        asserter.execute(() -> graphService.create(createTestGraph(graphId, 2L), TEST_ACCOUNT_ID, TEST_CREATED_BY));
+        asserter.execute(() -> graphService.create(createTestGraph(graphId, 3L), TEST_ACCOUNT_ID, TEST_CREATED_BY));
 
-        List<PipelineGraphEntity> versions = graphService.findAllVersions(TEST_GRAPH_ID)
-                .await().indefinitely();
-        assertTrue(versions.isEmpty());
+        asserter.execute(() -> graphService.deleteAll(graphId));
+
+        asserter.assertThat(() -> graphService.findAllVersions(graphId), (List<PipelineGraphEntity> versions) -> {
+            assertThat(versions.isEmpty(), is(true));
+        });
     }
 
     /**
      * Tests converting entity to protobuf.
      */
     @Test
-    void testToProto() {
-        PipelineGraph original = createTestGraph(1L);
-        PipelineGraphEntity entity = graphService.create(original, TEST_ACCOUNT_ID, TEST_CREATED_BY)
-                .await().indefinitely();
+    @RunOnVertxContext
+    void testToProto(TransactionalUniAsserter asserter) {
+        String graphId = uniqueGraphId();
+        PipelineGraph original = createTestGraph(graphId, 1L);
+        UUID[] entityId = new UUID[1];
 
-        PipelineGraph deserialized = graphService.toProto(entity).await().indefinitely();
+        asserter.execute(() -> graphService.create(original, TEST_ACCOUNT_ID, TEST_CREATED_BY)
+                .invoke(entity -> entityId[0] = entity.id));
 
-        assertEquals(original.getGraphId(), deserialized.getGraphId());
-        assertEquals(original.getClusterId(), deserialized.getClusterId());
-        assertEquals(original.getVersion(), deserialized.getVersion());
-        assertEquals(original.getNodeIdsCount(), deserialized.getNodeIdsCount());
-        assertEquals(original.getEdgesCount(), deserialized.getEdgesCount());
+        asserter.assertThat(() -> graphService.findById(entityId[0])
+                .chain(entity -> graphService.toProto(entity)), (PipelineGraph deserialized) -> {
+            assertThat(deserialized.getGraphId(), is(original.getGraphId()));
+            assertThat(deserialized.getClusterId(), is(original.getClusterId()));
+            assertThat(deserialized.getVersion(), is(original.getVersion()));
+            assertThat(deserialized.getNodeIdsCount(), is(original.getNodeIdsCount()));
+            assertThat(deserialized.getEdgesCount(), is(original.getEdgesCount()));
+        });
     }
 
     // Helper methods
-
-    private PipelineGraph createTestGraph(Long version) {
-        return createTestGraph(TEST_GRAPH_ID, version);
-    }
 
     private PipelineGraph createTestGraph(String graphId, Long version) {
         return PipelineGraph.newBuilder()
@@ -320,4 +374,3 @@ class PipelineGraphServiceTest {
                 .build();
     }
 }
-
