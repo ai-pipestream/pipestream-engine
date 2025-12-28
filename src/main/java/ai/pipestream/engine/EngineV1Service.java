@@ -4,6 +4,7 @@ import ai.pipestream.apicurio.registry.protobuf.ProtobufChannel;
 import ai.pipestream.apicurio.registry.protobuf.ProtobufEmitter;
 import ai.pipestream.config.v1.*;
 import ai.pipestream.data.module.v1.*;
+import ai.pipestream.data.v1.DocumentReference;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.PipeStream;
 import ai.pipestream.data.v1.StepExecutionRecord;
@@ -139,17 +140,29 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
     /**
      * Ensures the document in the stream is hydrated to the level required by the node.
      * <p>
-     * Currently simplified - assumes Level 2 hydration is not needed.
-     * In future implementations, this will check node capabilities and fetch
-     * additional document data from the repository as needed.
+     * Level 1 Hydration: If the stream contains a DocumentReference, fetches the full
+     * PipeDoc from the repository service.
+     * <p>
+     * Level 2 Hydration (future): Will check node capabilities and fetch blob content
+     * if the module needs it (e.g., parsers).
      *
      * @param stream The stream containing the document to potentially hydrate
      * @param node The node configuration specifying hydration requirements
      * @return A Uni that completes with the hydrated stream
      */
     private Uni<PipeStream> ensureHydration(PipeStream stream, GraphNode node) {
-        // Note: Logic for checking capabilities suppressed for now due to compilation issues
-        // with missing field in generated code. We assume no Level 2 hydration for now.
+        // Level 1 Hydration: Check if we need to fetch from repository
+        if (stream.hasDocumentRef()) {
+            DocumentReference ref = stream.getDocumentRef();
+            return repoClient.getPipeDocByReference(ref)
+                    .map(doc -> stream.toBuilder()
+                            .clearDocumentRef()
+                            .setDocument(doc)
+                            .build());
+        }
+        
+        // Document is already inline, no Level 1 hydration needed
+        // Note: Level 2 blob hydration will be added later when checking module capabilities
         return Uni.createFrom().item(stream);
     }
 
@@ -167,6 +180,12 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
      */
     private Uni<PipeDoc> callModule(PipeStream stream, GraphNode node) {
         String moduleId = node.getModuleId();
+        
+        // Note: stream should already be hydrated via ensureHydration() before this is called
+        if (!stream.hasDocument()) {
+            LOG.errorf("Cannot call module %s - stream %s does not have a document", moduleId, stream.getStreamId());
+            return Uni.createFrom().failure(new IllegalStateException("Stream document must be hydrated before calling module"));
+        }
         String serviceName = graphCache.getModule(moduleId)
                 .map(ModuleDefinition::getGrpcServiceName)
                 .filter(s -> !s.isEmpty())
@@ -276,15 +295,30 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                 .build();
 
         if (edge.getTransportType() == TransportType.TRANSPORT_TYPE_MESSAGING) {
-            return repoClient.savePipeDoc(nextStream.getDocument(), "default")
-                .flatMap(nodeId -> {
-                    PipeDoc refDoc = PipeDoc.newBuilder()
-                            .setDocId(nextStream.getDocument().getDocId())
-                            .setOwnership(nextStream.getDocument().getOwnership())
+            PipeDoc doc = nextStream.hasDocument() ? nextStream.getDocument() : null;
+            if (doc == null) {
+                LOG.warnf("Cannot dispatch stream %s - document is not hydrated", nextStream.getStreamId());
+                return Uni.createFrom().failure(new IllegalStateException("Document must be hydrated before Kafka dispatch"));
+            }
+            
+            // Use the current node ID as the graph_location_id when saving to repository
+            // This identifies which graph node processed this document state
+            String graphLocationId = nextStream.getCurrentNodeId();
+            String accountId = nextStream.getMetadata().getAccountId();
+            
+            return repoClient.savePipeDoc(doc, "default", graphLocationId)
+                .flatMap(repositoryNodeId -> {
+                    // Create DocumentReference using the graph location ID (source_node_id in proto)
+                    // This allows the next node to retrieve the document via GetPipeDocByReference
+                    DocumentReference docRef = DocumentReference.newBuilder()
+                            .setDocId(doc.getDocId())
+                            .setSourceNodeId(graphLocationId)  // proto field name is source_node_id, represents graph_address_id
+                            .setAccountId(accountId)
                             .build();
                             
                     PipeStream refStream = nextStream.toBuilder()
-                            .setDocument(refDoc)
+                            .clearDocument()
+                            .setDocumentRef(docRef)
                             .build();
 
                     String topic = edge.getKafkaTopic();

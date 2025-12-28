@@ -100,7 +100,19 @@ public class CelEvaluatorService {
             CelRuntime.Program program = cel.createProgram(ast);
 
             Map<String, Object> input = new HashMap<>();
-            input.put("document", stream.getDocument());
+            // Extract document from stream (handles both inline and reference)
+            // Note: CEL evaluation needs the full document, so if only a reference exists,
+            // the caller should hydrate first. For now, we assume hydration happens before CEL evaluation.
+            if (stream.hasDocument()) {
+                input.put("document", stream.getDocument());
+            } else if (stream.hasDocumentRef()) {
+                // TODO: Should hydrate here, but for now log warning
+                LOG.warnf("CEL evaluation called with document_ref - document should be hydrated first");
+                input.put("document", null); // Will cause CEL evaluation to fail
+            } else {
+                LOG.warnf("CEL evaluation called with no document - stream may be in invalid state");
+                input.put("document", null);
+            }
             input.put("stream", stream);
 
             return program.eval(input);

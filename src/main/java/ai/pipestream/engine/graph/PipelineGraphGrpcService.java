@@ -55,11 +55,11 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
      */
     @Override
     public Uni<CreateGraphResponse> createGraph(CreateGraphRequest request) {
-        LOG.debugf("CreateGraph: graph_id=%s, version=%d, account_id=%s",
-                request.getGraph().getGraphId(), request.getGraph().getVersion(), request.getAccountId());
+        LOG.debugf("CreateGraph: graph_id=%s, version=%d",
+                request.getGraph().getGraphId(), request.getGraph().getVersion());
 
         return Panache.withTransaction(() ->
-            graphService.create(request.getGraph(), request.getAccountId(), request.getCreatedBy())
+            graphService.create(request.getGraph(), request.getCreatedBy())
                 .map(entity -> {
                     broadcastEvent(GraphUpdateType.GRAPH_UPDATE_TYPE_CREATED, entity);
                     return toCreateResponse(entity);
@@ -72,10 +72,10 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
      */
     @Override
     public Uni<CreateAndActivateGraphResponse> createAndActivateGraph(CreateAndActivateGraphRequest request) {
-        LOG.debugf("CreateAndActivateGraph: graph_id=%s, version=%d, account_id=%s",
-                request.getGraph().getGraphId(), request.getGraph().getVersion(), request.getAccountId());
+        LOG.debugf("CreateAndActivateGraph: graph_id=%s, version=%d",
+                request.getGraph().getGraphId(), request.getGraph().getVersion());
 
-        return graphService.createAndActivate(request.getGraph(), request.getAccountId(), request.getCreatedBy())
+        return graphService.createAndActivate(request.getGraph(), request.getCreatedBy())
             .map(entity -> {
                 broadcastEvent(GraphUpdateType.GRAPH_UPDATE_TYPE_CREATED, entity);
                 broadcastEvent(GraphUpdateType.GRAPH_UPDATE_TYPE_ACTIVATED, entity);
@@ -360,7 +360,6 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
                 .setGraph(entity.toProto())
                 .setId(entity.id.toString())
                 .setIsActive(entity.isActive)
-                .setAccountId(entity.accountId != null ? entity.accountId : "")
                 .setCreatedBy(entity.createdBy != null ? entity.createdBy : "")
                 .setCreatedAt(toTimestamp(entity.createdAt))
                 .setFound(true)
@@ -372,7 +371,6 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
                 .setGraph(entity.toProto())
                 .setId(entity.id.toString())
                 .setIsActive(entity.isActive)
-                .setAccountId(entity.accountId != null ? entity.accountId : "")
                 .setCreatedBy(entity.createdBy != null ? entity.createdBy : "")
                 .setCreatedAt(toTimestamp(entity.createdAt))
                 .setFound(true)
@@ -384,7 +382,6 @@ public class PipelineGraphGrpcService extends MutinyPipelineGraphServiceGrpc.Pip
                 .setGraph(entity.toProto())
                 .setId(entity.id.toString())
                 .setIsActive(entity.isActive)
-                .setAccountId(entity.accountId != null ? entity.accountId : "")
                 .setCreatedBy(entity.createdBy != null ? entity.createdBy : "")
                 .setCreatedAt(toTimestamp(entity.createdAt))
                 .setFound(true)

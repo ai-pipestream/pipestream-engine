@@ -2,6 +2,8 @@ package ai.pipestream.engine.graph;
 
 import ai.pipestream.config.v1.GraphEdge;
 import ai.pipestream.config.v1.GraphMode;
+import ai.pipestream.config.v1.GraphNode;
+import ai.pipestream.config.v1.NodeType;
 import ai.pipestream.config.v1.PipelineGraph;
 import ai.pipestream.config.v1.TransportType;
 import io.quarkus.test.junit.QuarkusTest;
@@ -37,9 +39,24 @@ class PipelineGraphEntityTest {
                 .setDescription("A test graph for serialization testing")
                 .setVersion(1L)
                 .setMode(GraphMode.GRAPH_MODE_PRODUCTION)
-                .addNodeIds("node-1")
-                .addNodeIds("node-2")
-                .addNodeIds("node-3")
+                .addNodes(GraphNode.newBuilder()
+                        .setNodeId("node-1")
+                        .setClusterId("test-cluster")
+                        .setName("Node 1")
+                        .setNodeType(NodeType.NODE_TYPE_PROCESSOR)
+                        .build())
+                .addNodes(GraphNode.newBuilder()
+                        .setNodeId("node-2")
+                        .setClusterId("test-cluster")
+                        .setName("Node 2")
+                        .setNodeType(NodeType.NODE_TYPE_PROCESSOR)
+                        .build())
+                .addNodes(GraphNode.newBuilder()
+                        .setNodeId("node-3")
+                        .setClusterId("test-cluster")
+                        .setName("Node 3")
+                        .setNodeType(NodeType.NODE_TYPE_PROCESSOR)
+                        .build())
                 .addEdges(GraphEdge.newBuilder()
                         .setEdgeId("edge-1")
                         .setFromNodeId("node-1")
@@ -65,7 +82,6 @@ class PipelineGraphEntityTest {
         // Serialize to entity
         PipelineGraphEntity entity = PipelineGraphEntity.fromProto(
                 original, 
-                "test-account", 
                 "test-user", 
                 true
         );
@@ -75,7 +91,6 @@ class PipelineGraphEntityTest {
         assertThat(entity.graphData, is(not(emptyString())));
         assertThat(entity.graphId, is("test-graph-1"));
         assertThat(entity.clusterId, is("test-cluster"));
-        assertThat(entity.accountId, is("test-account"));
         assertThat(entity.version, is(1L));
         assertThat(entity.isActive, is(true));
         assertThat(entity.createdAt, is(notNullValue()));
@@ -91,10 +106,10 @@ class PipelineGraphEntityTest {
         assertThat(deserialized.getDescription(), is(original.getDescription()));
         assertThat(deserialized.getVersion(), is(original.getVersion()));
         assertThat(deserialized.getMode(), is(original.getMode()));
-        assertThat(deserialized.getNodeIdsCount(), is(original.getNodeIdsCount()));
-        assertThat(deserialized.getNodeIds(0), is(original.getNodeIds(0)));
-        assertThat(deserialized.getNodeIds(1), is(original.getNodeIds(1)));
-        assertThat(deserialized.getNodeIds(2), is(original.getNodeIds(2)));
+        assertThat(deserialized.getNodesCount(), is(original.getNodesCount()));
+        assertThat(deserialized.getNodes(0).getNodeId(), is(original.getNodes(0).getNodeId()));
+        assertThat(deserialized.getNodes(1).getNodeId(), is(original.getNodes(1).getNodeId()));
+        assertThat(deserialized.getNodes(2).getNodeId(), is(original.getNodes(2).getNodeId()));
         assertThat(deserialized.getEdgesCount(), is(original.getEdgesCount()));
         
         // Verify first edge
@@ -132,13 +147,13 @@ class PipelineGraphEntityTest {
                 .setVersion(1L)
                 .build();
 
-        PipelineGraphEntity entity = PipelineGraphEntity.fromProto(minimal, "account-1", "user-1", false);
+        PipelineGraphEntity entity = PipelineGraphEntity.fromProto(minimal, "user-1", false);
         PipelineGraph deserialized = entity.toProto();
 
         assertThat(deserialized.getGraphId(), is(minimal.getGraphId()));
         assertThat(deserialized.getClusterId(), is(minimal.getClusterId()));
         assertThat(deserialized.getVersion(), is(minimal.getVersion()));
-        assertThat(deserialized.getNodeIdsCount(), is(0));
+        assertThat(deserialized.getNodesCount(), is(0));
         assertThat(deserialized.getEdgesCount(), is(0));
     }
 
@@ -156,10 +171,30 @@ class PipelineGraphEntityTest {
                 .setDescription("A graph with many nodes and edges")
                 .setVersion(42L)
                 .setMode(GraphMode.GRAPH_MODE_DESIGN)
-                .addNodeIds("parser-node")
-                .addNodeIds("chunker-node")
-                .addNodeIds("embedder-node")
-                .addNodeIds("sink-node")
+                .addNodes(GraphNode.newBuilder()
+                        .setNodeId("parser-node")
+                        .setClusterId("cluster-1")
+                        .setName("Parser Node")
+                        .setNodeType(NodeType.NODE_TYPE_PROCESSOR)
+                        .build())
+                .addNodes(GraphNode.newBuilder()
+                        .setNodeId("chunker-node")
+                        .setClusterId("cluster-1")
+                        .setName("Chunker Node")
+                        .setNodeType(NodeType.NODE_TYPE_PROCESSOR)
+                        .build())
+                .addNodes(GraphNode.newBuilder()
+                        .setNodeId("embedder-node")
+                        .setClusterId("cluster-1")
+                        .setName("Embedder Node")
+                        .setNodeType(NodeType.NODE_TYPE_PROCESSOR)
+                        .build())
+                .addNodes(GraphNode.newBuilder()
+                        .setNodeId("sink-node")
+                        .setClusterId("cluster-1")
+                        .setName("Sink Node")
+                        .setNodeType(NodeType.NODE_TYPE_SINK)
+                        .build())
                 .addEdges(GraphEdge.newBuilder()
                         .setEdgeId("e1")
                         .setFromNodeId("parser-node")
@@ -188,11 +223,11 @@ class PipelineGraphEntityTest {
                         .build())
                 .build();
 
-        PipelineGraphEntity entity = PipelineGraphEntity.fromProto(complex, "account-1", "system", true);
+        PipelineGraphEntity entity = PipelineGraphEntity.fromProto(complex, "system", true);
         PipelineGraph deserialized = entity.toProto();
 
         // Verify structure
-        assertThat(deserialized.getNodeIdsCount(), is(4));
+        assertThat(deserialized.getNodesCount(), is(4));
         assertThat(deserialized.getEdgesCount(), is(3));
         
         // Verify cross-cluster edge
@@ -216,7 +251,6 @@ class PipelineGraphEntityTest {
         PipelineGraphEntity entity = new PipelineGraphEntity();
         entity.graphId = "test-graph";
         entity.clusterId = "cluster-1";
-        entity.accountId = "account-1";
         entity.version = 1L;
         entity.graphData = "invalid json {";
         entity.isActive = false;
@@ -240,14 +274,12 @@ class PipelineGraphEntityTest {
 
         PipelineGraphEntity entity = PipelineGraphEntity.fromProto(
                 graph, 
-                "account-123", 
                 "admin-user", 
                 true
         );
 
         assertThat(entity.graphId, is("test-graph"));
         assertThat(entity.clusterId, is("cluster-1"));
-        assertThat(entity.accountId, is("account-123"));
         assertThat(entity.version, is(5L));
         assertThat(entity.createdBy, is("admin-user"));
         assertThat(entity.isActive, is(true));

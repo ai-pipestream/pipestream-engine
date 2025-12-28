@@ -54,8 +54,8 @@ public class GraphCache {
      * Loads an entire PipelineGraph into the cache.
      * <p>
      * Delegates to {@link #rebuild(PipelineGraph)} for atomic state rebuilding.
-     * Note: PipelineGraph only contains node IDs, not full GraphNode definitions.
-     * Nodes must be added separately via {@link #putNode(GraphNode)}.
+     * PipelineGraph now contains embedded GraphNode definitions, which are automatically
+     * extracted and cached during rebuild.
      *
      * @param graph The complete pipeline graph definition to cache
      */
@@ -69,21 +69,33 @@ public class GraphCache {
      * Rebuilds the cache from a complete PipelineGraph with atomic state swapping.
      * <p>
      * This method follows the pattern described in the architecture documentation:
-     * 1. Builds new index structures (nodes, edges, modules)
-     * 2. Groups edges by source node and sorts by priority
-     * 3. Atomically swaps all volatile references at the end
+     * 1. Extracts embedded nodes from the graph and indexes them
+     * 2. Builds new index structures (nodes, edges, modules)
+     * 3. Groups edges by source node and sorts by priority
+     * 4. Atomically swaps all volatile references at the end
      * <p>
      * This ensures that processing threads never see a partially updated or
      * inconsistent graph state. All lookups during rebuild will continue to
      * see the previous version until the swap completes.
      * <p>
-     * Note: PipelineGraph proto only contains node IDs, not full GraphNode objects.
-     * Nodes should be loaded separately before or after calling rebuild.
+     * PipelineGraph now contains embedded GraphNode objects, so nodes are
+     * automatically extracted and cached. Module definitions are still managed separately.
      *
      * @param graph The complete pipeline graph definition to cache
      */
     public void rebuild(PipelineGraph graph) {
         LOG.infof("Rebuilding graph cache: %s (Version: %d)", graph.getName(), graph.getVersion());
+
+        // Extract and index embedded nodes
+        Map<String, GraphNode> newNodeMap = new ConcurrentHashMap<>();
+        for (GraphNode node : graph.getNodesList()) {
+            String nodeId = node.getNodeId();
+            if (nodeId == null || nodeId.isEmpty()) {
+                LOG.warnf("Skipping node with missing node_id: %s", node.getName());
+                continue;
+            }
+            newNodeMap.put(nodeId, node);
+        }
 
         // Build new edge index structure (non-volatile during construction)
         Map<String, List<GraphEdge>> newOutgoingEdgesMap = new HashMap<>();
@@ -118,12 +130,13 @@ public class GraphCache {
         // Atomic state swap - all processing threads will see the new state immediately
         this.currentGraph = graph;
         this.currentVersion = graph.getVersion();
+        this.nodeMap = newNodeMap;
         this.outgoingEdgesMap = unmodifiableEdgesMap;
-        // Note: nodeMap and moduleMap are preserved (not cleared) as they may be added separately
+        // Note: moduleMap is preserved (not cleared) as modules are managed separately
         // entryNodeMap is preserved as it's maintained independently
 
         LOG.infof("Graph cache rebuilt successfully: %d nodes, %d edge groups, %d modules, version %d",
-                this.nodeMap.size(), unmodifiableEdgesMap.size(), this.moduleMap.size(), graph.getVersion());
+                newNodeMap.size(), unmodifiableEdgesMap.size(), this.moduleMap.size(), graph.getVersion());
     }
 
     /**
@@ -182,9 +195,9 @@ public class GraphCache {
     /**
      * Stores a node definition in the cache.
      * <p>
-     * Nodes can be added before or after calling rebuild(). This allows
-     * PipelineGraph (which only contains node IDs) to be loaded first,
-     * followed by the actual GraphNode definitions.
+     * This method allows for incremental node updates after rebuild().
+     * Note: Nodes are now automatically extracted from PipelineGraph during rebuild(),
+     * so this method is primarily useful for incremental updates or dynamic node additions.
      *
      * @param node The node definition to cache
      */

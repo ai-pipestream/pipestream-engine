@@ -220,19 +220,24 @@ sequenceDiagram
     Note over S,E: Processing Node B (v2)
 ```
 
-## Multi-Tenant Isolation
+## Graph Ownership and Isolation
 
-Isolation is maintained at the database and engine levels to ensure that processing logic and data do not leak between accounts or clusters.
+Graphs are platform-owned infrastructure, not tied to individual accounts. Multiple accounts' data can traverse through the same graph nodes. Isolation is maintained at the cluster and data levels.
 
-### Isolation Mechanisms
-- **Account Scoping**: Every graph is explicitly tied to an `account_id`.
+### Ownership Model
+- **Graph Ownership**: Graphs belong to the platform/app, not to accounts. This allows multiple accounts' data to share the same pipeline infrastructure.
+- **Data Ownership**: Accounts own the data being processed (identified via `PipeDoc.ownership.account_id`), not the graphs that process it.
 - **Cluster Assignment**: Engines only load graphs assigned to their specific `cluster_id`.
 - **Cross-Cluster Routing**: Explicitly handled via `CrossClusterEdge` types which define target clusters.
 
+### Isolation Mechanisms
+- **Cluster Isolation**: Engines load only graphs for their assigned `cluster_id`.
+- **Data-Level Isolation**: Account IDs are tracked at the document level (`PipeDoc.ownership.account_id`), ensuring data from different accounts doesn't mix during processing.
+- **Access Control**: Authentication/authorization for graph management operations is handled via Okta/IAM at the API layer, separate from data ownership.
+
 ```sql
--- Engines load only their assigned active graphs
+-- Engines load only their assigned active graphs (no account_id filtering)
 SELECT * FROM pipeline_graphs 
-WHERE account_id = ? 
-  AND cluster_id = ? 
+WHERE cluster_id = ? 
   AND is_active = true;
 ```

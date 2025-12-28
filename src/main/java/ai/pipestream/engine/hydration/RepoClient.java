@@ -1,5 +1,6 @@
 package ai.pipestream.engine.hydration;
 
+import ai.pipestream.data.v1.DocumentReference;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
 import ai.pipestream.repository.pipedoc.v1.*;
@@ -28,7 +29,7 @@ public class RepoClient {
     private static final String REPOSITORY_SERVICE_NAME = "repository-service";
 
     /**
-     * Fetches a fully hydrated PipeDoc from the repository.
+     * Fetches a fully hydrated PipeDoc from the repository by repository node ID.
      * <p>
      * Uses dynamic gRPC client creation to connect to the repository service
      * and retrieve the complete document data by its node identifier.
@@ -49,6 +50,30 @@ public class RepoClient {
     }
 
     /**
+     * Fetches a fully hydrated PipeDoc from the repository using a DocumentReference.
+     * <p>
+     * This is the preferred method for Engine hydration when documents are referenced
+     * via doc_id, source_node_id, and account_id. Uses dynamic gRPC client creation
+     * to connect to the repository service and retrieve the complete document data
+     * based on logical identifiers.
+     *
+     * @param documentRef The document reference containing doc_id, source_node_id, and account_id
+     * @return A Uni that completes with the fully hydrated PipeDoc
+     */
+    public Uni<PipeDoc> getPipeDocByReference(DocumentReference documentRef) {
+        LOG.debugf("Fetching PipeDoc by reference: doc_id=%s, source_node_id=%s, account_id=%s", 
+                documentRef.getDocId(), documentRef.getSourceNodeId(), documentRef.getAccountId());
+        
+        GetPipeDocByReferenceRequest request = GetPipeDocByReferenceRequest.newBuilder()
+                .setDocumentRef(documentRef)
+                .build();
+
+        return grpcClientFactory.getClient(REPOSITORY_SERVICE_NAME, MutinyPipeDocServiceGrpc::newMutinyStub)
+                .flatMap(stub -> stub.getPipeDocByReference(request))
+                .map(GetPipeDocByReferenceResponse::getPipedoc);
+    }
+
+    /**
      * Saves a PipeDoc to the repository (Dehydration).
      * <p>
      * This is required before sending a reference over Kafka to avoid
@@ -57,10 +82,13 @@ public class RepoClient {
      *
      * @param doc The document to save to the repository
      * @param drive The drive/bucket identifier where to store the document
-     * @return A Uni that completes with the saved document's node ID for referencing
+     * @param graphLocationId The graph location ID (node ID) where this document was processed.
+     *                        If null, the repository service will use datasource_id as fallback.
+     * @return A Uni that completes with the saved document's node ID (UUID) for referencing
      */
-    public Uni<String> savePipeDoc(PipeDoc doc, String drive) {
-        LOG.debugf("Saving PipeDoc with ID: %s to drive: %s", doc.getDocId(), drive);
+    public Uni<String> savePipeDoc(PipeDoc doc, String drive, String graphLocationId) {
+        LOG.debugf("Saving PipeDoc with ID: %s to drive: %s, graph_location_id: %s", 
+                doc.getDocId(), drive, graphLocationId);
         
         SavePipeDocRequest.Builder requestBuilder = SavePipeDocRequest.newBuilder()
                 .setPipedoc(doc)
@@ -68,6 +96,14 @@ public class RepoClient {
         
         if (doc.hasOwnership() && doc.getOwnership().hasConnectorId()) {
             requestBuilder.setConnectorId(doc.getOwnership().getConnectorId());
+        }
+
+        // Set graph_address oneof: either graph_location_id or use_datasource_id
+        if (graphLocationId != null && !graphLocationId.isEmpty()) {
+            requestBuilder.setGraphLocationId(graphLocationId);
+        } else {
+            // If no graph_location_id provided, use datasource_id (for initial intake)
+            requestBuilder.setUseDatasourceId(true);
         }
 
         SavePipeDocRequest request = requestBuilder.build();

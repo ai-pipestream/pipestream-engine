@@ -56,10 +56,6 @@ public class PipelineGraphEntity extends PanacheEntityBase {
     @Column(name = "cluster_id", nullable = false, length = 255)
     public String clusterId;
 
-    /** Account identifier for multi-tenant isolation. */
-    @Column(name = "account_id", nullable = false, length = 255)
-    public String accountId;
-
     /** Version number - auto-incremented per graph_id for sequential versioning. */
     @Column(name = "version", nullable = false)
     public Long version;
@@ -121,10 +117,6 @@ public class PipelineGraphEntity extends PanacheEntityBase {
             // Serialize PipelineGraph to JSON
             entity.graphData = JsonFormat.printer().print(graph);
             
-            // Extract account_id from graph if available (might be in metadata)
-            // For now, we'll require it to be set separately or included in the graph
-            // This can be enhanced based on how account_id is stored in the proto
-            
             return entity;
         } catch (InvalidProtocolBufferException e) {
             LOG.errorf(e, "Failed to serialize PipelineGraph to JSON for graph_id=%s", graph.getGraphId());
@@ -136,14 +128,12 @@ public class PipelineGraphEntity extends PanacheEntityBase {
      * Creates an entity from a PipelineGraph protobuf message with additional metadata.
      *
      * @param graph The PipelineGraph protobuf to store
-     * @param accountId The account identifier for multi-tenant isolation
      * @param createdBy The user/service that created this version
      * @param isActive Whether this version should be marked as active
      * @return A new entity instance ready for persistence
      */
-    public static PipelineGraphEntity fromProto(PipelineGraph graph, String accountId, String createdBy, boolean isActive) {
+    public static PipelineGraphEntity fromProto(PipelineGraph graph, String createdBy, boolean isActive) {
         PipelineGraphEntity entity = fromProto(graph);
-        entity.accountId = accountId;
         entity.createdBy = createdBy;
         entity.isActive = isActive;
         return entity;

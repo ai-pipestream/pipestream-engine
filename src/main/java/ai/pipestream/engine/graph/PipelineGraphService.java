@@ -30,15 +30,14 @@ public class PipelineGraphService {
      * The entity is created with the current timestamp and marked as inactive by default.
      *
      * @param graph The PipelineGraph protobuf to store
-     * @param accountId The account identifier for multi-tenant isolation
      * @param createdBy The user/service creating this version
      * @return A Uni that completes with the persisted entity
      */
-    public Uni<PipelineGraphEntity> create(PipelineGraph graph, String accountId, String createdBy) {
+    public Uni<PipelineGraphEntity> create(PipelineGraph graph, String createdBy) {
         LOG.debugf("Creating graph: graph_id=%s, version=%d, cluster_id=%s", 
                 graph.getGraphId(), graph.getVersion(), graph.getClusterId());
         
-        PipelineGraphEntity entity = PipelineGraphEntity.fromProto(graph, accountId, createdBy, false);
+        PipelineGraphEntity entity = PipelineGraphEntity.fromProto(graph, createdBy, false);
         return entity.persist();
     }
 
@@ -49,15 +48,14 @@ public class PipelineGraphService {
      * ensuring only one active version exists at a time.
      *
      * @param graph The PipelineGraph protobuf to store
-     * @param accountId The account identifier for multi-tenant isolation
      * @param createdBy The user/service creating this version
      * @return A Uni that completes with the persisted and activated entity
      */
-    public Uni<PipelineGraphEntity> createAndActivate(PipelineGraph graph, String accountId, String createdBy) {
+    public Uni<PipelineGraphEntity> createAndActivate(PipelineGraph graph, String createdBy) {
         return Panache.withTransaction(() -> 
             deactivateAll(graph.getGraphId(), graph.getClusterId())
                 .chain(() -> {
-                    PipelineGraphEntity entity = PipelineGraphEntity.fromProto(graph, accountId, createdBy, true);
+                    PipelineGraphEntity entity = PipelineGraphEntity.fromProto(graph, createdBy, true);
                     return entity.persist();
                 })
         );
