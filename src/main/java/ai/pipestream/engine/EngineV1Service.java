@@ -4,12 +4,15 @@ import ai.pipestream.apicurio.registry.protobuf.ProtobufChannel;
 import ai.pipestream.apicurio.registry.protobuf.ProtobufEmitter;
 import ai.pipestream.config.v1.*;
 import ai.pipestream.data.module.v1.*;
+import ai.pipestream.data.v1.Blob;
+import ai.pipestream.data.v1.BlobBag;
 import ai.pipestream.data.v1.DocumentReference;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.PipeStream;
 import ai.pipestream.data.v1.StepExecutionRecord;
 import ai.pipestream.engine.graph.GraphCache;
 import ai.pipestream.engine.hydration.RepoClient;
+import ai.pipestream.engine.module.ModuleCapabilityService;
 import ai.pipestream.engine.routing.CelEvaluatorService;
 import ai.pipestream.engine.v1.*;
 import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
@@ -58,6 +61,10 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
     /** Injected service for evaluating CEL (Common Expression Language) conditions for routing. */
     @Inject
     CelEvaluatorService celEvaluator;
+
+    /** Injected service for querying module capabilities to determine hydration requirements. */
+    @Inject
+    ModuleCapabilityService capabilityService;
 
     /** Injected factory for creating dynamic gRPC clients for module communication. */
     @Inject
@@ -143,27 +150,120 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
      * Level 1 Hydration: If the stream contains a DocumentReference, fetches the full
      * PipeDoc from the repository service.
      * <p>
-     * Level 2 Hydration (future): Will check node capabilities and fetch blob content
-     * if the module needs it (e.g., parsers).
+     * Level 2 Hydration: Checks module capabilities to determine if blob content is needed.
+     * If the module has {@code CAPABILITY_TYPE_PARSER}, blobs are hydrated. Otherwise,
+     * blobs are left as storage references to avoid unnecessary data transfer.
+     * <p>
+     * The hydration decision follows this logic:
+     * <ul>
+     *   <li>If module has PARSER capability → hydrate blobs (parsers need raw binary)</li>
+     *   <li>If module has no PARSER capability → skip blob hydration (work with parsed metadata)</li>
+     *   <li>If capability query fails → skip blob hydration (safe default)</li>
+     * </ul>
      *
      * @param stream The stream containing the document to potentially hydrate
      * @param node The node configuration specifying hydration requirements
      * @return A Uni that completes with the hydrated stream
      */
     private Uni<PipeStream> ensureHydration(PipeStream stream, GraphNode node) {
+        String moduleId = node.getModuleId();
+        
         // Level 1 Hydration: Check if we need to fetch from repository
         if (stream.hasDocumentRef()) {
             DocumentReference ref = stream.getDocumentRef();
             return repoClient.getPipeDocByReference(ref)
-                    .map(doc -> stream.toBuilder()
-                            .clearDocumentRef()
-                            .setDocument(doc)
+                    .flatMap(doc -> {
+                        // After Level 1, check for Level 2 hydration based on module capabilities
+                        return capabilityService.requiresBlobContent(moduleId)
+                                .flatMap(needsBlob -> {
+                                    if (needsBlob) {
+                                        return hydrateBlobsIfNeeded(doc);
+                                    } else {
+                                        LOG.debugf("Module %s does not require blob content - skipping Level 2 hydration", moduleId);
+                                        return Uni.createFrom().item(doc);
+                                    }
+                                })
+                                .map(hydratedDoc -> stream.toBuilder()
+                                        .clearDocumentRef()
+                                        .setDocument(hydratedDoc)
+                                        .build());
+                    });
+        }
+        
+        // Document is already inline, check for Level 2 hydration based on module capabilities
+        if (stream.hasDocument()) {
+            return capabilityService.requiresBlobContent(moduleId)
+                    .flatMap(needsBlob -> {
+                        if (needsBlob) {
+                            return hydrateBlobsIfNeeded(stream.getDocument());
+                        } else {
+                            LOG.debugf("Module %s does not require blob content - skipping Level 2 hydration", moduleId);
+                            return Uni.createFrom().item(stream.getDocument());
+                        }
+                    })
+                    .map(hydratedDoc -> stream.toBuilder()
+                            .setDocument(hydratedDoc)
                             .build());
         }
         
-        // Document is already inline, no Level 1 hydration needed
-        // Note: Level 2 blob hydration will be added later when checking module capabilities
+        // No document or reference - return as-is
         return Uni.createFrom().item(stream);
+    }
+
+    /**
+     * Performs Level 2 blob hydration: fetches blob bytes from repository for any blobs
+     * that have a storage_ref but no inline data.
+     * <p>
+     * This method handles both single-blob BlobBag (via getBlob()) and multi-blob BlobBag
+     * (via getBlobsList() if the proto supports it). For each blob that needs hydration, it:
+     * 1. Extracts the FileStorageReference
+     * 2. Calls RepoClient.getBlob() to fetch the bytes
+     * 3. Replaces storage_ref with inline data
+     * <p>
+     * Note: Currently handles single blob case. Multi-blob support will be added when
+     * the proto structure is confirmed.
+     *
+     * @param doc The PipeDoc that may contain blobs needing hydration
+     * @return A Uni that completes with the PipeDoc with all blobs hydrated
+     */
+    private Uni<PipeDoc> hydrateBlobsIfNeeded(PipeDoc doc) {
+        if (!doc.hasBlobBag()) {
+            // No blobs to hydrate
+            return Uni.createFrom().item(doc);
+        }
+
+        BlobBag blobBag = doc.getBlobBag();
+
+        // Check if single blob needs hydration
+        if (blobBag.hasBlob()) {
+            Blob blob = blobBag.getBlob();
+            if (blob.hasStorageRef() && !blob.hasData()) {
+                // Need to hydrate this blob
+                LOG.debugf("Hydrating blob with storage_ref: drive=%s, object_key=%s", 
+                        blob.getStorageRef().getDriveName(), blob.getStorageRef().getObjectKey());
+                return repoClient.getBlob(blob.getStorageRef())
+                        .map(blobData -> {
+                            Blob hydratedBlob = blob.toBuilder()
+                                    .setData(blobData)
+                                    .clearStorageRef()
+                                    .build();
+                            LOG.debugf("Blob hydrated successfully: size=%d bytes", blobData.size());
+                            return doc.toBuilder()
+                                    .setBlobBag(blobBag.toBuilder()
+                                            .setBlob(hydratedBlob)
+                                            .build())
+                                    .build();
+                        })
+                        .onFailure().invoke(throwable -> 
+                                LOG.errorf(throwable, "Failed to hydrate blob: drive=%s, object_key=%s",
+                                        blob.getStorageRef().getDriveName(), 
+                                        blob.getStorageRef().getObjectKey()));
+            }
+        }
+
+        // TODO: Add support for multi-blob BlobBag when proto structure is confirmed
+        // For now, if blob is already hydrated or has no storage_ref, return as-is
+        return Uni.createFrom().item(doc);
     }
 
     /**

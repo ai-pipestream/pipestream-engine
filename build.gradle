@@ -95,6 +95,7 @@ dependencies {
     testImplementation 'io.quarkus:quarkus-test-hibernate-reactive-panache'
     testImplementation 'io.rest-assured:rest-assured'
     testImplementation 'org.testcontainers:postgresql'
+    testImplementation 'org.testcontainers:testcontainers'
 
     testImplementation libs.memoryfilesystem
 
