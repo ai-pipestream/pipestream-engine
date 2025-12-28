@@ -60,14 +60,30 @@ graph TD
 
 | Layer | Knows About | Doesn't Know About |
 |-------|-------------|-------------------|
-| **Engine** | doc_id, node_id, account_id | S3 buckets, paths, keys |
-| **Sidecar** | doc_id, node_id, account_id | S3 buckets, paths, keys |
+| **Engine** | doc_id, node_id, account_id | S3 buckets, paths, keys, cluster organization |
+| **Sidecar** | doc_id, node_id, account_id | S3 buckets, paths, keys, cluster organization |
 | **Repo Service** | Everything | N/A - owns the abstraction |
 
 This ensures:
 - **Security**: S3 credentials and paths never leak to processing layer
 - **Flexibility**: Repo Service can change storage backend without affecting Engine
 - **Multi-tenancy**: Account isolation is enforced at the Repo Service level
+- **Multi-cluster support**: Engine doesn't need to know about S3 path organization (intake vs cluster subdirectories)
+
+### S3 Path Structure (Repository Service Implementation Detail)
+
+The repository service organizes documents in S3 using a hierarchical structure that groups all states of the same logical document:
+
+- **Intake**: `{prefix}/{account}/{connector}/{datasource}/{docId}/intake/{uuid}.pb`
+- **Cluster Processing**: `{prefix}/{account}/{connector}/{datasource}/{docId}/{clusterId}/{uuid}.pb`
+
+This structure enables:
+- **Multi-cluster processing**: Same document can be processed by multiple clusters
+- **Easy recrawling**: Original intake documents preserved separately
+- **Cluster seeding**: New clusters can replay from intake data
+- **Clear audit trail**: All document states are visible and organized
+
+The Engine never sees these paths - it only works with `DocumentReference` objects containing logical identifiers (`doc_id`, `graph_address_id`, `account_id`).
 
 ## Engine Hydration Implementation
 

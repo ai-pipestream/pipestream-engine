@@ -306,7 +306,9 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
             String graphLocationId = nextStream.getCurrentNodeId();
             String accountId = nextStream.getMetadata().getAccountId();
             
-            return repoClient.savePipeDoc(doc, "default", graphLocationId)
+            // Pass currentClusterId so the repository service can organize documents by cluster
+            // This determines the S3 path structure: .../{clusterId}/{uuid}.pb
+            return repoClient.savePipeDoc(doc, "default", graphLocationId, currentClusterId)
                 .flatMap(repositoryNodeId -> {
                     // Create DocumentReference using the graph location ID (source_node_id in proto)
                     // This allows the next node to retrieve the document via GetPipeDocByReference

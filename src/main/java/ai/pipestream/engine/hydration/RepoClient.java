@@ -1,9 +1,11 @@
 package ai.pipestream.engine.hydration;
 
 import ai.pipestream.data.v1.DocumentReference;
+import ai.pipestream.data.v1.FileStorageReference;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
 import ai.pipestream.repository.pipedoc.v1.*;
+import com.google.protobuf.ByteString;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -84,11 +86,12 @@ public class RepoClient {
      * @param drive The drive/bucket identifier where to store the document
      * @param graphLocationId The graph location ID (node ID) where this document was processed.
      *                        If null, the repository service will use datasource_id as fallback.
+     * @param clusterId The cluster ID where this document was processed (null for intake)
      * @return A Uni that completes with the saved document's node ID (UUID) for referencing
      */
-    public Uni<String> savePipeDoc(PipeDoc doc, String drive, String graphLocationId) {
-        LOG.debugf("Saving PipeDoc with ID: %s to drive: %s, graph_location_id: %s", 
-                doc.getDocId(), drive, graphLocationId);
+    public Uni<String> savePipeDoc(PipeDoc doc, String drive, String graphLocationId, String clusterId) {
+        LOG.debugf("Saving PipeDoc with ID: %s to drive: %s, graph_location_id: %s, cluster_id: %s", 
+                doc.getDocId(), drive, graphLocationId, clusterId != null ? clusterId : "null (intake)");
         
         SavePipeDocRequest.Builder requestBuilder = SavePipeDocRequest.newBuilder()
                 .setPipedoc(doc)
@@ -105,11 +108,38 @@ public class RepoClient {
             // If no graph_location_id provided, use datasource_id (for initial intake)
             requestBuilder.setUseDatasourceId(true);
         }
+        
+        // Set cluster_id if provided (null for intake, cluster name for cluster processing)
+        if (clusterId != null && !clusterId.isEmpty()) {
+            requestBuilder.setClusterId(clusterId);
+        }
 
         SavePipeDocRequest request = requestBuilder.build();
 
         return grpcClientFactory.getClient(REPOSITORY_SERVICE_NAME, MutinyPipeDocServiceGrpc::newMutinyStub)
                 .flatMap(stub -> stub.savePipeDoc(request))
                 .map(SavePipeDocResponse::getNodeId);
+    }
+
+    /**
+     * Fetches blob binary content from the repository using a FileStorageReference (Level 2 Hydration).
+     * <p>
+     * This is used when a module requires the raw binary content (e.g., parsers like Tika).
+     * The FileStorageReference is obtained from a PipeDoc's BlobBag after Level 1 hydration.
+     *
+     * @param storageRef The file storage reference containing drive name, object key, and optional version ID
+     * @return A Uni that completes with the blob binary data as a ByteString
+     */
+    public Uni<com.google.protobuf.ByteString> getBlob(ai.pipestream.data.v1.FileStorageReference storageRef) {
+        LOG.debugf("Fetching blob from repository: drive=%s, object_key=%s", 
+                storageRef.getDriveName(), storageRef.getObjectKey());
+        
+        GetBlobRequest request = GetBlobRequest.newBuilder()
+                .setStorageRef(storageRef)
+                .build();
+
+        return grpcClientFactory.getClient(REPOSITORY_SERVICE_NAME, MutinyPipeDocServiceGrpc::newMutinyStub)
+                .flatMap(stub -> stub.getBlob(request))
+                .map(GetBlobResponse::getData);
     }
 }
