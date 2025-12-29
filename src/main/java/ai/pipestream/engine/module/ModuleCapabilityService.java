@@ -104,6 +104,10 @@ public class ModuleCapabilityService {
      *         or empty if the module is not found or does not report capabilities
      */
     public Uni<Optional<Capabilities>> getCapabilities(String moduleId) {
+        if (moduleId == null) {
+            return Uni.createFrom().item(Optional.empty());
+        }
+
         // Check cache first
         Optional<Capabilities> cached = capabilityCache.get(moduleId);
         if (cached != null) {
