@@ -6,6 +6,7 @@ import ai.pipestream.config.v1.*;
 import ai.pipestream.data.module.v1.*;
 import ai.pipestream.data.v1.Blob;
 import ai.pipestream.data.v1.BlobBag;
+import ai.pipestream.data.v1.Blobs;
 import ai.pipestream.data.v1.DocumentReference;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.PipeStream;
@@ -32,6 +33,7 @@ import org.jboss.logging.Logger;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -357,13 +359,13 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
      * that have a storage_ref but no inline data.
      * <p>
      * This method handles both single-blob BlobBag (via getBlob()) and multi-blob BlobBag
-     * (via getBlobsList() if the proto supports it). For each blob that needs hydration, it:
+     * (via getBlobs()). For each blob that needs hydration, it:
      * 1. Extracts the FileStorageReference
-     * 2. Calls RepoClient.getBlob() to fetch the bytes
+     * 2. Calls RepoClient.getBlob() to fetch the bytes (in parallel for multiple blobs)
      * 3. Replaces storage_ref with inline data
      * <p>
-     * Note: Currently handles single blob case. Multi-blob support will be added when
-     * the proto structure is confirmed.
+     * Single blobs are hydrated sequentially, while multiple blobs are hydrated in parallel
+     * for better performance.
      *
      * @param doc The PipeDoc that may contain blobs needing hydration
      * @return A Uni that completes with the PipeDoc with all blobs hydrated
@@ -401,11 +403,100 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                                         blob.getStorageRef().getDriveName(), 
                                         blob.getStorageRef().getObjectKey()));
             }
+            // Single blob already hydrated or has no storage_ref, return as-is
+            return Uni.createFrom().item(doc);
         }
 
-        // TODO: Add support for multi-blob BlobBag when proto structure is confirmed
-        // For now, if blob is already hydrated or has no storage_ref, return as-is
+        // Check if multiple blobs need hydration
+        if (blobBag.hasBlobs()) {
+            return hydrateMultipleBlobs(doc, blobBag.getBlobs());
+        }
+
+        // No blobs or unknown blob type, return as-is
         return Uni.createFrom().item(doc);
+    }
+
+    /**
+     * Hydrates multiple blobs in parallel for a Blobs collection.
+     * <p>
+     * For each blob that has a storage_ref but no inline data, fetches the blob bytes
+     * from the repository service in parallel. Blobs that are already hydrated or don't
+     * need hydration are returned as-is.
+     *
+     * @param doc The PipeDoc containing the multi-blob BlobBag
+     * @param blobs The Blobs collection containing multiple blobs
+     * @return A Uni that completes with the PipeDoc with all blobs hydrated
+     */
+    private Uni<PipeDoc> hydrateMultipleBlobs(PipeDoc doc, Blobs blobs) {
+        List<Blob> blobList = blobs.getBlobList();
+        
+        // Check if any blobs need hydration
+        boolean needsHydration = blobList.stream()
+                .anyMatch(blob -> blob.hasStorageRef() && !blob.hasData());
+        
+        if (!needsHydration) {
+            // No blobs need hydration, return as-is
+            return Uni.createFrom().item(doc);
+        }
+        
+        // Create a list of Unis, one for each blob
+        // Each Uni will resolve to a hydrated Blob (or the original if already hydrated)
+        List<Uni<Blob>> blobHydrationTasks = new ArrayList<>();
+        
+        for (int i = 0; i < blobList.size(); i++) {
+            Blob blob = blobList.get(i);
+            int blobIndex = i + 1; // 1-based index for logging
+            
+            if (blob.hasStorageRef() && !blob.hasData()) {
+                // Need to hydrate this blob
+                LOG.debugf("Hydrating blob %d/%d with storage_ref: drive=%s, object_key=%s",
+                        blobIndex, blobList.size(),
+                        blob.getStorageRef().getDriveName(), blob.getStorageRef().getObjectKey());
+                
+                Uni<Blob> hydratedBlobUni = repoClient.getBlob(blob.getStorageRef())
+                        .map(blobData -> {
+                            Blob hydratedBlob = blob.toBuilder()
+                                    .setData(blobData)
+                                    .clearStorageRef()
+                                    .build();
+                            LOG.debugf("Blob %d/%d hydrated successfully: size=%d bytes",
+                                    blobIndex, blobList.size(), blobData.size());
+                            return hydratedBlob;
+                        })
+                        .onFailure().invoke(throwable -> 
+                                LOG.errorf(throwable, "Failed to hydrate blob %d/%d: drive=%s, object_key=%s",
+                                        blobIndex, blobList.size(),
+                                        blob.getStorageRef().getDriveName(),
+                                        blob.getStorageRef().getObjectKey()));
+                blobHydrationTasks.add(hydratedBlobUni);
+            } else {
+                // Already hydrated or no storage_ref, return as-is
+                blobHydrationTasks.add(Uni.createFrom().item(blob));
+            }
+        }
+        
+        // Execute all hydration tasks in parallel and collect results
+        // Using Uni.join() for type-safe List<Blob> instead of Uni.combine() which returns List<Object>
+        return Uni.join().all(blobHydrationTasks).andFailFast().map(hydratedBlobsList -> {
+                    // Rebuild the Blobs collection with hydrated blobs
+                    Blobs.Builder blobsBuilder = Blobs.newBuilder();
+                    for (Blob hydratedBlob : hydratedBlobsList) {
+                        blobsBuilder.addBlob(hydratedBlob);
+                    }
+                    Blobs hydratedBlobs = blobsBuilder.build();
+
+                    // Rebuild the BlobBag with hydrated Blobs
+                    BlobBag hydratedBlobBag = doc.getBlobBag().toBuilder()
+                            .setBlobs(hydratedBlobs)
+                            .build();
+
+                    // Rebuild the PipeDoc with hydrated BlobBag
+                    return doc.toBuilder()
+                            .setBlobBag(hydratedBlobBag)
+                            .build();
+                })
+                .onFailure().invoke(throwable -> 
+                        LOG.errorf(throwable, "Failed to hydrate multiple blobs: %d blobs total", blobList.size()));
     }
 
     /**

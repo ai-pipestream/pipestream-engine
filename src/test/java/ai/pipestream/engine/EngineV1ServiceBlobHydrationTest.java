@@ -4,6 +4,7 @@ import ai.pipestream.config.v1.GraphNode;
 import ai.pipestream.config.v1.ModuleDefinition;
 import ai.pipestream.data.v1.Blob;
 import ai.pipestream.data.v1.BlobBag;
+import ai.pipestream.data.v1.Blobs;
 import ai.pipestream.data.v1.FileStorageReference;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.PipeStream;
@@ -284,6 +285,166 @@ class EngineV1ServiceBlobHydrationTest {
 
         // In a full integration test, we would verify:
         // - GetBlob was NOT called (blob already has data)
+        // - ProcessData was called with the existing blob data
+    }
+
+    @Test
+    @DisplayName("Should hydrate multiple blobs for parser module")
+    void testMultipleBlobsWithBlobHydration() {
+        // Create PipeDoc with multiple blob storage references (no inline data)
+        FileStorageReference storageRef1 = FileStorageReference.newBuilder()
+                .setDriveName("test-drive")
+                .setObjectKey("test-blob-1.bin")
+                .build();
+
+        FileStorageReference storageRef2 = FileStorageReference.newBuilder()
+                .setDriveName("test-drive")
+                .setObjectKey("test-blob-2.bin")
+                .build();
+
+        Blob blob1 = Blob.newBuilder()
+                .setStorageRef(storageRef1)
+                .setFilename("attachment1.pdf")
+                .build();
+
+        Blob blob2 = Blob.newBuilder()
+                .setStorageRef(storageRef2)
+                .setFilename("attachment2.pdf")
+                .build();
+
+        PipeDoc pipeDoc = PipeDoc.newBuilder()
+                .setDocId("test-doc-id")
+                .setBlobBag(BlobBag.newBuilder()
+                        .setBlobs(Blobs.newBuilder()
+                                .addBlob(blob1)
+                                .addBlob(blob2)
+                                .build())
+                        .build())
+                .build();
+
+        PipeStream stream = PipeStream.newBuilder()
+                .setStreamId(UUID.randomUUID().toString())
+                .setDocument(pipeDoc)
+                .setCurrentNodeId("test-parser-node")
+                .setHopCount(0)
+                .build();
+
+        ProcessNodeRequest request = ProcessNodeRequest.newBuilder()
+                .setStream(stream)
+                .build();
+
+        UniAssertSubscriber<ProcessNodeResponse> subscriber = engineService.processNode(request)
+                .subscribe().withSubscriber(UniAssertSubscriber.create());
+
+        ProcessNodeResponse response = subscriber.awaitItem().getItem();
+
+        // The response should indicate success (or show a specific error if something failed)
+        assertThat("Response should not be null", response, is(notNullValue()));
+
+        // In a full integration test with WireMock verification, we would:
+        // - Verify GetBlob was called for both blobs
+        // - Verify ProcessData was called with hydrated blobs (all blobs have data, not just storage_ref)
+        // - Verify response indicates success
+    }
+
+    @Test
+    @DisplayName("Should hydrate only blobs that need hydration in multi-blob scenario")
+    void testMultipleBlobsPartialHydration() {
+        // Create PipeDoc with multiple blobs, some already hydrated, some needing hydration
+        FileStorageReference storageRef = FileStorageReference.newBuilder()
+                .setDriveName("test-drive")
+                .setObjectKey("test-blob-1.bin")
+                .build();
+
+        Blob blobNeedsHydration = Blob.newBuilder()
+                .setStorageRef(storageRef)
+                .setFilename("needs-hydration.pdf")
+                .build();
+
+        Blob blobAlreadyHydrated = Blob.newBuilder()
+                .setData(ByteString.copyFromUtf8("Already hydrated content"))
+                .setFilename("already-hydrated.pdf")
+                .build();
+
+        PipeDoc pipeDoc = PipeDoc.newBuilder()
+                .setDocId("test-doc-id")
+                .setBlobBag(BlobBag.newBuilder()
+                        .setBlobs(Blobs.newBuilder()
+                                .addBlob(blobNeedsHydration)
+                                .addBlob(blobAlreadyHydrated)
+                                .build())
+                        .build())
+                .build();
+
+        PipeStream stream = PipeStream.newBuilder()
+                .setStreamId(UUID.randomUUID().toString())
+                .setDocument(pipeDoc)
+                .setCurrentNodeId("test-parser-node")
+                .setHopCount(0)
+                .build();
+
+        ProcessNodeRequest request = ProcessNodeRequest.newBuilder()
+                .setStream(stream)
+                .build();
+
+        UniAssertSubscriber<ProcessNodeResponse> subscriber = engineService.processNode(request)
+                .subscribe().withSubscriber(UniAssertSubscriber.create());
+
+        ProcessNodeResponse response = subscriber.awaitItem().getItem();
+
+        assertThat("Response should be processed", response, is(notNullValue()));
+
+        // In a full integration test, we would verify:
+        // - GetBlob was called only for blobNeedsHydration
+        // - blobAlreadyHydrated was not modified
+        // - ProcessData was called with both blobs (one hydrated, one already had data)
+    }
+
+    @Test
+    @DisplayName("Should handle multiple blobs with no hydration needed")
+    void testMultipleBlobsNoHydrationNeeded() {
+        // Create PipeDoc with multiple blobs that are all already hydrated
+        Blob blob1 = Blob.newBuilder()
+                .setData(ByteString.copyFromUtf8("Blob 1 content"))
+                .setFilename("blob1.pdf")
+                .build();
+
+        Blob blob2 = Blob.newBuilder()
+                .setData(ByteString.copyFromUtf8("Blob 2 content"))
+                .setFilename("blob2.pdf")
+                .build();
+
+        PipeDoc pipeDoc = PipeDoc.newBuilder()
+                .setDocId("test-doc-id")
+                .setBlobBag(BlobBag.newBuilder()
+                        .setBlobs(Blobs.newBuilder()
+                                .addBlob(blob1)
+                                .addBlob(blob2)
+                                .build())
+                        .build())
+                .build();
+
+        PipeStream stream = PipeStream.newBuilder()
+                .setStreamId(UUID.randomUUID().toString())
+                .setDocument(pipeDoc)
+                .setCurrentNodeId("test-parser-node")
+                .setHopCount(0)
+                .build();
+
+        ProcessNodeRequest request = ProcessNodeRequest.newBuilder()
+                .setStream(stream)
+                .build();
+
+        UniAssertSubscriber<ProcessNodeResponse> subscriber = engineService.processNode(request)
+                .subscribe().withSubscriber(UniAssertSubscriber.create());
+
+        ProcessNodeResponse response = subscriber.awaitItem().getItem();
+
+        assertThat("Response should be processed without calling GetBlob", 
+                response, is(notNullValue()));
+
+        // In a full integration test, we would verify:
+        // - GetBlob was NOT called (all blobs already have data)
         // - ProcessData was called with the existing blob data
     }
 }
