@@ -704,7 +704,8 @@ class EngineV1ServiceProcessingPipelineTest {
             graphCache.putNode(node);
 
             assertThat("Save on error flag should be set",
-                    graphCache.getNode("save-on-error-node").get().getSaveOnError(), is(true));
+                      graphCache.getNode("save-on-error-node")
+                          .await().indefinitely().get().getSaveOnError(), is(true));
         }
 
         @Test
@@ -720,7 +721,8 @@ class EngineV1ServiceProcessingPipelineTest {
             graphCache.putNode(node);
 
             assertThat("Save on error flag should default to false",
-                    graphCache.getNode("default-node").get().getSaveOnError(), is(false));
+                      graphCache.getNode("default-node")
+                          .await().indefinitely().get().getSaveOnError(), is(false));
         }
 
         @Test

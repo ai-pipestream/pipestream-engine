@@ -115,17 +115,18 @@ public class ModuleCapabilityService {
             return Uni.createFrom().item(cached);
         }
 
-        // Resolve service name from graph cache
-        String serviceName = graphCache.getModule(moduleId)
+        // Resolve service name from graph cache (reactive)
+        return graphCache.getModule(moduleId)
+            .map(moduleOpt -> moduleOpt
                 .map(module -> {
                     String grpcServiceName = module.getGrpcServiceName();
                     return (grpcServiceName != null && !grpcServiceName.isEmpty()) 
                             ? grpcServiceName 
                             : moduleId;
                 })
-                .orElse(moduleId);
-
-        LOG.debugf("Querying capabilities for module %s (service: %s)", moduleId, serviceName);
+                .orElse(moduleId))
+            .flatMap(serviceName -> {
+                LOG.debugf("Querying capabilities for module %s (service: %s)", moduleId, serviceName);
 
         // Query module via GetServiceRegistration with x-module-name header
         // This allows WireMock to return module-specific capabilities
@@ -136,8 +137,8 @@ public class ModuleCapabilityService {
         Metadata.Key<String> moduleNameKey = Metadata.Key.of("x-module-name", Metadata.ASCII_STRING_MARSHALLER);
         metadata.put(moduleNameKey, moduleId);
 
-        // Get channel and create stub with metadata interceptor
-        return grpcClientFactory.getChannel(serviceName)
+                // Get channel and create stub with metadata interceptor
+                return grpcClientFactory.getChannel(serviceName)
                 .map(channel -> {
                     // Add metadata interceptor to attach x-module-name header
                     Channel interceptedChannel = ClientInterceptors.intercept(
@@ -167,6 +168,7 @@ public class ModuleCapabilityService {
                     capabilityCache.put(moduleId, Optional.empty());
                     return Uni.createFrom().item(Optional.<Capabilities>empty());
                 });
+            });
     }
 
     /**

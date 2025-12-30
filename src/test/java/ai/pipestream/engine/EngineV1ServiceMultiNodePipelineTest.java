@@ -314,10 +314,10 @@ class EngineV1ServiceMultiNodePipelineTest {
         ProcessNodeResponse response = subscriber.awaitItem().getItem();
 
         // Should return failure response, not throw exception
-        assertThat("Response should indicate failure", 
+        assertThat("Response should indicate failure",
                 response.getSuccess(), is(false));
-        assertThat("Error message should mention node not found", 
-                response.getMessage(), containsString("Node not found"));
+        assertThat("Error message should mention node not found",
+                response.getMessage(), containsString("not found"));
     }
 }
 

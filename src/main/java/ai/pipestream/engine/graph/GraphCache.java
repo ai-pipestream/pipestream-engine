@@ -4,6 +4,7 @@ import ai.pipestream.config.v1.GraphEdge;
 import ai.pipestream.config.v1.GraphNode;
 import ai.pipestream.config.v1.ModuleDefinition;
 import ai.pipestream.config.v1.PipelineGraph;
+import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -140,12 +141,15 @@ public class GraphCache {
     }
 
     /**
-     * Retrieves the current cached graph.
+     * Retrieves the current cached graph (reactive).
+     * <p>
+     * Since GraphCache uses volatile references, this lookup is thread-safe.
+     * Wrapped in Uni for reactive composition.
      *
-     * @return The current PipelineGraph, or null if no graph has been loaded
+     * @return A Uni that completes with the current PipelineGraph, or null if no graph has been loaded
      */
-    public PipelineGraph getCurrentGraph() {
-        return currentGraph;
+    public Uni<PipelineGraph> getCurrentGraph() {
+        return Uni.createFrom().item(() -> currentGraph);
     }
 
     /**
@@ -158,38 +162,43 @@ public class GraphCache {
     }
 
     /**
-     * Retrieves a node definition by its ID.
+     * Retrieves a node definition by its ID (reactive).
      * <p>
      * Uses the volatile nodeMap reference for thread-safe access.
+     * Wrapped in Uni for reactive composition.
      *
      * @param nodeId The unique identifier of the node
-     * @return An Optional containing the node if found, empty otherwise
+     * @return A Uni that completes with an Optional containing the node if found, empty otherwise
      */
-    public Optional<GraphNode> getNode(String nodeId) {
-        return Optional.ofNullable(nodeMap.get(nodeId));
+    public Uni<Optional<GraphNode>> getNode(String nodeId) {
+        return Uni.createFrom().item(() -> Optional.ofNullable(nodeMap.get(nodeId)));
     }
 
     /**
-     * Retrieves all outgoing edges from a given node.
+     * Retrieves all outgoing edges from a given node (reactive).
      * <p>
      * Returns edges sorted by priority (ascending - lower number = higher priority).
      * Uses the volatile outgoingEdgesMap reference for thread-safe access.
+     * Wrapped in Uni for reactive composition.
      *
      * @param nodeId The source node ID
-     * @return An unmodifiable list of edges from the specified node (empty if none found)
+     * @return A Uni that completes with an unmodifiable list of edges from the specified node (empty if none found)
      */
-    public List<GraphEdge> getOutgoingEdges(String nodeId) {
-        return outgoingEdgesMap.getOrDefault(nodeId, Collections.emptyList());
+    public Uni<List<GraphEdge>> getOutgoingEdges(String nodeId) {
+        return Uni.createFrom().item(() -> outgoingEdgesMap.getOrDefault(nodeId, Collections.emptyList()));
     }
 
     /**
-     * Retrieves a module definition by its ID.
+     * Retrieves a module definition by its ID (reactive).
+     * <p>
+     * Uses the volatile moduleMap reference for thread-safe access.
+     * Wrapped in Uni for reactive composition.
      *
      * @param moduleId The unique identifier of the module
-     * @return An Optional containing the module definition if found, empty otherwise
+     * @return A Uni that completes with an Optional containing the module definition if found, empty otherwise
      */
-    public Optional<ModuleDefinition> getModule(String moduleId) {
-        return Optional.ofNullable(moduleMap.get(moduleId));
+    public Uni<Optional<ModuleDefinition>> getModule(String moduleId) {
+        return Uni.createFrom().item(() -> Optional.ofNullable(moduleMap.get(moduleId)));
     }
 
     /**
@@ -267,13 +276,16 @@ public class GraphCache {
     }
 
     /**
-     * Retrieves the entry node ID for a specific datasource.
+     * Retrieves the entry node ID for a specific datasource (reactive).
+     * <p>
+     * Uses the volatile entryNodeMap reference for thread-safe access.
+     * Wrapped in Uni for reactive composition.
      *
      * @param datasourceId The identifier of the data source
-     * @return An Optional containing the entry node ID if registered, empty otherwise
+     * @return A Uni that completes with an Optional containing the entry node ID if registered, empty otherwise
      */
-    public Optional<String> getEntryNodeId(String datasourceId) {
-        return Optional.ofNullable(entryNodeMap.get(datasourceId));
+    public Uni<Optional<String>> getEntryNodeId(String datasourceId) {
+        return Uni.createFrom().item(() -> Optional.ofNullable(entryNodeMap.get(datasourceId)));
     }
     
     /**

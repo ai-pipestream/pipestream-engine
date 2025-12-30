@@ -17,6 +17,7 @@ import ai.pipestream.engine.hydration.RepoClient;
 import ai.pipestream.engine.mapping.MappingEngine;
 import ai.pipestream.engine.module.ModuleCapabilityService;
 import ai.pipestream.engine.routing.CelEvaluatorService;
+import ai.pipestream.engine.validation.GraphValidationService;
 import ai.pipestream.engine.v1.*;
 import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
 import com.google.protobuf.Timestamp;
@@ -78,6 +79,10 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
     @Inject
     MappingEngine mappingEngine;
 
+    /** Injected service for validating graph structure and node references. */
+    @Inject
+    GraphValidationService graphValidationService;
+
     /** Injected factory for creating dynamic gRPC clients for module communication. */
     @Inject
     DynamicGrpcClientFactory grpcClientFactory;
@@ -102,6 +107,10 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
     /** Maximum delay for exponential backoff in milliseconds (default: 2000ms). */
     @ConfigProperty(name = "pipestream.module.retry.max-delay-ms", defaultValue = "2000")
     long moduleRetryMaxDelayMs;
+
+    /** Service instance identifier (pod name/IP) for execution metadata tracking. */
+    @ConfigProperty(name = "pipestream.engine.instance-id", defaultValue = "${HOSTNAME:unknown}")
+    String serviceInstanceId;
 
     /** gRPC status codes that trigger retry (UNAVAILABLE, DEADLINE_EXCEEDED by default). */
     private static final Set<Status.Code> RETRYABLE_STATUS_CODES = Set.of(
@@ -128,13 +137,13 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
         
         LOG.debugf("ProcessNode: Stream %s at Node %s", stream.getStreamId(), nodeId);
 
-        return Uni.createFrom().item(() -> graphCache.getNode(nodeId))
-            .flatMap(nodeOpt -> {
-                if (nodeOpt.isEmpty()) {
-                    return Uni.createFrom().failure(new RuntimeException("Node not found in graph: " + nodeId));
-                }
-                return Uni.createFrom().item(nodeOpt.get());
-            })
+        // Extract accountId from stream metadata (default to empty string if not available)
+        String accountId = stream.hasMetadata() 
+            ? stream.getMetadata().getAccountId() 
+            : "";
+
+        // Validate node exists in graph before processing
+        return graphValidationService.validateNodeExists(nodeId, accountId)
             .flatMap(node -> processNodeLogic(stream, node))
             .map(updatedStream -> ProcessNodeResponse.newBuilder()
                     .setSuccess(true)
@@ -166,6 +175,9 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
      * @return A Uni that completes with the processed stream
      */
     private Uni<PipeStream> processNodeLogic(PipeStream stream, GraphNode node) {
+        // Capture start time for execution metadata
+        final Instant startTime = Instant.now();
+
         // 1. Hydrate (Level 1 & 2) if needed
         return ensureHydration(stream, node)
             .flatMap(hydratedStream -> {
@@ -184,8 +196,8 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                         // 5. Apply post-mappings
                         .flatMap(resultDoc -> applyPostMappings(resultDoc, preMappedStream, node)))
                     .flatMap(postMappedDoc -> {
-                        // 6. Update Metadata & History
-                        PipeStream updatedStream = updateStreamMetadata(hydratedStream, postMappedDoc, node);
+                        // 6. Update Metadata & History (with start time for duration calculation)
+                        PipeStream updatedStream = updateStreamMetadata(hydratedStream, postMappedDoc, node, startTime);
 
                         // 7. Route to Next
                         return routeToNextNodes(updatedStream, node);
@@ -522,11 +534,6 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
             LOG.errorf("Cannot call module %s - stream %s does not have a document", moduleId, stream.getStreamId());
             return Uni.createFrom().failure(new IllegalStateException("Stream document must be hydrated before calling module"));
         }
-        String serviceName = graphCache.getModule(moduleId)
-                .map(ModuleDefinition::getGrpcServiceName)
-                .filter(s -> !s.isEmpty())
-                .orElse(moduleId);
-
         // Build ProcessConfiguration from GraphNode's custom_config
         ProcessConfiguration.Builder configBuilder = ProcessConfiguration.newBuilder();
         if (node.hasCustomConfig()) {
@@ -546,8 +553,16 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                         .build())
                 .build();
 
-        return grpcClientFactory.getClient(serviceName, MutinyPipeStepProcessorServiceGrpc::newMutinyStub)
-                .flatMap(stub -> stub.processData(request))
+        // Resolve service name from graph cache (reactive) and call module
+        return graphCache.getModule(moduleId)
+            .map(moduleOpt -> {
+                return moduleOpt
+                    .map(ModuleDefinition::getGrpcServiceName)
+                    .filter(s -> !s.isEmpty())
+                    .orElse(moduleId);
+            })
+            .flatMap(serviceName -> grpcClientFactory.getClient(serviceName, MutinyPipeStepProcessorServiceGrpc::newMutinyStub)
+                    .flatMap(stub -> stub.processData(request)))
                 .onFailure(this::isRetryableFailure).retry()
                     .withBackOff(
                             Duration.ofMillis(moduleRetryInitialDelayMs),
@@ -606,19 +621,31 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
      * Creates execution history records, increments hop count, updates the
      * current node ID, and records the processing timestamp. This metadata
      * is used for observability, debugging, and routing decisions.
+     * <p>
+     * Captures execution timing (start_time, end_time) and the service instance ID
+     * to support distributed tracing and performance analysis.
      *
      * @param stream The original input stream
      * @param outputDoc The processed document output from the module
      * @param node The node that performed the processing
+     * @param startTime The instant when processing began (for duration calculation)
      * @return A new PipeStream instance with updated metadata
      */
-    private PipeStream updateStreamMetadata(PipeStream stream, PipeDoc outputDoc, GraphNode node) {
-        Timestamp now = Timestamps.fromMillis(Instant.now().toEpochMilli());
-        
+    private PipeStream updateStreamMetadata(PipeStream stream, PipeDoc outputDoc, GraphNode node, Instant startTime) {
+        Instant endTime = Instant.now();
+        Timestamp startTimestamp = Timestamps.fromMillis(startTime.toEpochMilli());
+        Timestamp endTimestamp = Timestamps.fromMillis(endTime.toEpochMilli());
+        long durationMs = java.time.Duration.between(startTime, endTime).toMillis();
+
+        LOG.debugf("Step %s completed in %d ms (instance: %s)",
+                node.getName(), durationMs, serviceInstanceId);
+
         StepExecutionRecord history = StepExecutionRecord.newBuilder()
                 .setStepName(node.getName())
                 .setHopNumber(stream.getHopCount() + 1)
-                .setEndTime(now)
+                .setServiceInstanceId(serviceInstanceId)
+                .setStartTime(startTimestamp)
+                .setEndTime(endTimestamp)
                 .setStatus("SUCCESS")
                 .build();
 
@@ -628,7 +655,7 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                 .setCurrentNodeId(node.getNodeId())
                 .addProcessingPath(node.getNodeId())
                 .setMetadata(stream.getMetadata().toBuilder()
-                        .setLastProcessedAt(now)
+                        .setLastProcessedAt(endTimestamp)
                         .addHistory(history)
                         .build())
                 .build();
@@ -646,20 +673,21 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
      * @return A Uni that completes when all routing operations finish
      */
     private Uni<PipeStream> routeToNextNodes(PipeStream stream, GraphNode node) {
-        List<GraphEdge> edges = graphCache.getOutgoingEdges(node.getNodeId());
-        
-        List<Uni<Void>> routings = edges.stream()
-            .filter(edge -> celEvaluator.evaluate(edge.getCondition(), stream))
-            .map(edge -> dispatch(stream, edge))
-            .collect(Collectors.toList());
-            
-        if (routings.isEmpty()) {
-            LOG.debugf("Stream %s finished at node %s (terminal)", stream.getStreamId(), node.getNodeId());
-            return Uni.createFrom().item(stream);
-        }
+        return graphCache.getOutgoingEdges(node.getNodeId())
+            .flatMap(edges -> {
+                List<Uni<Void>> routings = edges.stream()
+                    .filter(edge -> celEvaluator.evaluate(edge.getCondition(), stream))
+                    .map(edge -> dispatch(stream, edge))
+                    .collect(Collectors.toList());
+                
+                if (routings.isEmpty()) {
+                    LOG.debugf("Stream %s finished at node %s (terminal)", stream.getStreamId(), node.getNodeId());
+                    return Uni.createFrom().item(stream);
+                }
 
-        return Uni.combine().all().unis(routings).discardItems()
-                .map(v -> stream);
+                return Uni.combine().all().unis(routings).discardItems()
+                        .map(v -> stream);
+            });
     }
 
     /**
@@ -766,7 +794,7 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
      */
     @Override
     public Uni<IntakeHandoffResponse> intakeHandoff(IntakeHandoffRequest request) {
-        return Uni.createFrom().item(() -> graphCache.getEntryNodeId(request.getDatasourceId()))
+        return graphCache.getEntryNodeId(request.getDatasourceId())
             .flatMap(nodeIdOpt -> {
                 if (nodeIdOpt.isEmpty()) {
                      return Uni.createFrom().failure(new RuntimeException("No entry node for datasource: " + request.getDatasourceId()));

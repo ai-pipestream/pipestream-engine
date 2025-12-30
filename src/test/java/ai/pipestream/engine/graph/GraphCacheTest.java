@@ -5,6 +5,7 @@ import ai.pipestream.config.v1.GraphNode;
 import ai.pipestream.config.v1.ModuleDefinition;
 import ai.pipestream.config.v1.TransportType;
 import io.quarkus.test.junit.QuarkusTest;
+import io.smallrye.mutiny.helpers.test.UniAssertSubscriber;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -34,10 +35,13 @@ class GraphCacheTest {
 
         graphCache.putNode(node);
 
-        var retrieved = graphCache.getNode("cluster.node-1");
-        assertTrue(retrieved.isPresent());
-        assertEquals("Test Node", retrieved.get().getName());
-        assertEquals("parser-module", retrieved.get().getModuleId());
+        var retrievedOpt = graphCache.getNode("cluster.node-1")
+            .subscribe().withSubscriber(UniAssertSubscriber.create())
+            .awaitItem()
+            .getItem();
+        assertTrue(retrievedOpt.isPresent());
+        assertEquals("Test Node", retrievedOpt.get().getName());
+        assertEquals("parser-module", retrievedOpt.get().getModuleId());
     }
 
     @Test
@@ -61,7 +65,10 @@ class GraphCacheTest {
         graphCache.putEdge(edge1);
         graphCache.putEdge(edge2);
 
-        List<GraphEdge> edges = graphCache.getOutgoingEdges("node-a");
+        List<GraphEdge> edges = graphCache.getOutgoingEdges("node-a")
+            .subscribe().withSubscriber(UniAssertSubscriber.create())
+            .awaitItem()
+            .getItem();
         assertEquals(2, edges.size());
         
         // Should be sorted by priority: edge-2 (5) then edge-1 (10)
@@ -78,17 +85,23 @@ class GraphCacheTest {
 
         graphCache.putModule(module);
 
-        var retrieved = graphCache.getModule("parser-v1");
-        assertTrue(retrieved.isPresent());
-        assertEquals("ai.pipestream.Parser", retrieved.get().getImplementationName());
+        var retrievedOpt = graphCache.getModule("parser-v1")
+            .subscribe().withSubscriber(UniAssertSubscriber.create())
+            .awaitItem()
+            .getItem();
+        assertTrue(retrievedOpt.isPresent());
+        assertEquals("ai.pipestream.Parser", retrievedOpt.get().getImplementationName());
     }
 
     @Test
     void testEntryNodeRegistration() {
         graphCache.registerEntryNode("ds-123", "node-start");
         
-        var nodeId = graphCache.getEntryNodeId("ds-123");
-        assertTrue(nodeId.isPresent());
-        assertEquals("node-start", nodeId.get());
+        var nodeIdOpt = graphCache.getEntryNodeId("ds-123")
+            .subscribe().withSubscriber(UniAssertSubscriber.create())
+            .awaitItem()
+            .getItem();
+        assertTrue(nodeIdOpt.isPresent());
+        assertEquals("node-start", nodeIdOpt.get());
     }
 }
