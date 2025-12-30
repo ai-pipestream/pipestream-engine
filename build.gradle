@@ -8,7 +8,7 @@ plugins {
     alias(libs.plugins.proto.toolchain)
 }
 
-def pipestreamBomVersion = findProperty('pipestreamBomVersion') ?: '0.7.10'
+def pipestreamBomVersion = findProperty('pipestreamBomVersion')
 
 // Axion-release configuration for automatic versioning
 scmVersion {
