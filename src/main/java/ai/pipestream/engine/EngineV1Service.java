@@ -12,6 +12,7 @@ import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.PipeStream;
 import ai.pipestream.data.v1.ProcessConfiguration;
 import ai.pipestream.data.v1.StepExecutionRecord;
+import ai.pipestream.engine.dlq.DlqException;
 import ai.pipestream.engine.dlq.DlqService;
 import ai.pipestream.engine.graph.GraphCache;
 import ai.pipestream.engine.hydration.RepoClient;
@@ -332,10 +333,10 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
             errorHandlingOps.add(saveErrorState(stream, node, error));
         }
 
-        // 2. Publish to DLQ if enabled
+        // 2. Publish to DLQ if enabled (with retry for resilience)
         if (node.getDlqConfig().getEnabled()) {
             LOG.debugf("DLQ enabled, publishing to DLQ for stream %s", stream.getStreamId());
-            errorHandlingOps.add(dlqService.publishToDlq(stream, node, error));
+            errorHandlingOps.add(publishToDlqWithRetry(stream, node, error));
         }
 
         // If no error handling operations, just fail immediately
@@ -377,6 +378,65 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                 .onFailure().invoke(saveError ->
                         LOG.errorf(saveError, "Failed to save error state for stream %s at node %s",
                                 stream.getStreamId(), node.getNodeId()));
+    }
+
+    /**
+     * Publishes to DLQ with retry logic for resilience against transient failures.
+     * <p>
+     * Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms) before giving up.
+     * On final failure, logs enriched context and records the failure metric.
+     *
+     * @param stream The stream that failed processing
+     * @param node The node where processing failed
+     * @param originalError The original processing error
+     * @return A Uni that completes when publish succeeds or all retries exhausted
+     */
+    private Uni<Void> publishToDlqWithRetry(PipeStream stream, GraphNode node, Throwable originalError) {
+        return dlqService.publishToDlq(stream, node, originalError)
+                .onFailure().retry()
+                    .withBackOff(Duration.ofMillis(100), Duration.ofMillis(400))
+                    .atMost(3)
+                .onFailure().invoke(dlqError -> {
+                    // Log enriched context on final failure
+                    logDlqPublishFailure(stream, node, originalError, dlqError);
+                })
+                .onFailure().recoverWithUni(dlqError -> {
+                    // Don't propagate DLQ failure - we don't want DLQ issues to mask the original error
+                    // The failure has been logged and metrics recorded by DlqService
+                    return Uni.createFrom().voidItem();
+                });
+    }
+
+    /**
+     * Logs enriched context when DLQ publishing fails after all retries.
+     *
+     * @param stream The stream that failed processing
+     * @param node The node where processing failed
+     * @param originalError The original processing error
+     * @param dlqError The DLQ publishing error
+     */
+    private void logDlqPublishFailure(PipeStream stream, GraphNode node,
+                                       Throwable originalError, Throwable dlqError) {
+        String streamId = stream.getStreamId();
+        String nodeId = node.getNodeId();
+        String accountId = stream.getMetadata().getAccountId();
+        String dlqTopic = node.getDlqConfig().getTopicOverride().isEmpty()
+                ? String.format("pipestream.%s.%s.dlq", currentClusterId, nodeId)
+                : node.getDlqConfig().getTopicOverride();
+
+        LOG.errorf("DLQ_PUBLISH_FAILURE: Failed to publish to DLQ after retries. " +
+                   "STREAM_ID=%s NODE_ID=%s ACCOUNT_ID=%s DLQ_TOPIC=%s " +
+                   "ORIGINAL_ERROR=[%s: %s] DLQ_ERROR=[%s: %s]",
+                streamId, nodeId, accountId, dlqTopic,
+                originalError.getClass().getSimpleName(), originalError.getMessage(),
+                dlqError.getClass().getSimpleName(), dlqError.getMessage());
+
+        // If it's a DlqException.PublishException, we can extract more details
+        if (dlqError instanceof DlqException.PublishException publishEx) {
+            LOG.errorf("DLQ_PUBLISH_FAILURE details: topic=%s, streamId=%s, cause=%s",
+                    publishEx.getTopic(), publishEx.getStreamId(),
+                    publishEx.getCause() != null ? publishEx.getCause().getMessage() : "unknown");
+        }
     }
 
     /**

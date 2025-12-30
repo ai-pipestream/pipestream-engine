@@ -41,6 +41,7 @@ class DlqServiceTest {
         setField(dlqService, "globalDlqTopic", "pipestream.global.dlq");
         setField(dlqService, "currentClusterId", "test-cluster");
         setField(dlqService, "maxRetryAttempts", 3);
+        setField(dlqService, "maxDlqReprocessCount", 3);
     }
 
     private void setField(Object obj, String fieldName, Object value) throws Exception {
@@ -360,6 +361,252 @@ class DlqServiceTest {
             DlqMessage message = buildDlqMessage(stream, node, new RuntimeException("Error"), dlqConfig);
 
             assertThat(message.getOriginalTopic(), is("pipestream.test-cluster.parser-v1"));
+        }
+
+        private DlqMessage buildDlqMessage(PipeStream stream, GraphNode node,
+                                            Throwable error, DlqConfig dlqConfig) {
+            try {
+                Method method = DlqService.class.getDeclaredMethod("buildDlqMessage",
+                        PipeStream.class, GraphNode.class, Throwable.class, DlqConfig.class);
+                method.setAccessible(true);
+                return (DlqMessage) method.invoke(dlqService, stream, node, error, dlqConfig);
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to invoke buildDlqMessage", e);
+            }
+        }
+    }
+
+    // ========== Quarantine and Reprocess Tests ==========
+
+    @Nested
+    @DisplayName("Quarantine and Reprocess Count")
+    class QuarantineTests {
+
+        @Test
+        @DisplayName("Should not quarantine when reprocess count is below max")
+        void testShouldNotQuarantineBelowMax() {
+            DlqMessage message = DlqMessage.newBuilder()
+                    .setDlqReprocessCount(0)
+                    .build();
+
+            assertFalse(dlqService.shouldQuarantine(message));
+
+            DlqMessage message2 = DlqMessage.newBuilder()
+                    .setDlqReprocessCount(2)
+                    .build();
+
+            assertFalse(dlqService.shouldQuarantine(message2));
+        }
+
+        @Test
+        @DisplayName("Should quarantine when reprocess count equals max")
+        void testShouldQuarantineAtMax() {
+            DlqMessage message = DlqMessage.newBuilder()
+                    .setDlqReprocessCount(3) // equals maxDlqReprocessCount
+                    .build();
+
+            assertTrue(dlqService.shouldQuarantine(message));
+        }
+
+        @Test
+        @DisplayName("Should quarantine when reprocess count exceeds max")
+        void testShouldQuarantineAboveMax() {
+            DlqMessage message = DlqMessage.newBuilder()
+                    .setDlqReprocessCount(5)
+                    .build();
+
+            assertTrue(dlqService.shouldQuarantine(message));
+        }
+
+        @Test
+        @DisplayName("Should detect already quarantined messages")
+        void testIsQuarantined() {
+            DlqMessage notQuarantined = DlqMessage.newBuilder()
+                    .setQuarantined(false)
+                    .build();
+
+            assertFalse(dlqService.isQuarantined(notQuarantined));
+
+            DlqMessage quarantined = DlqMessage.newBuilder()
+                    .setQuarantined(true)
+                    .build();
+
+            assertTrue(dlqService.isQuarantined(quarantined));
+        }
+
+        @Test
+        @DisplayName("Default message should not be quarantined")
+        void testDefaultNotQuarantined() {
+            DlqMessage defaultMessage = DlqMessage.getDefaultInstance();
+
+            assertFalse(dlqService.isQuarantined(defaultMessage));
+            assertFalse(dlqService.shouldQuarantine(defaultMessage));
+        }
+
+        @Test
+        @DisplayName("Quarantine topic should follow naming convention")
+        void testQuarantineTopicNaming() {
+            GraphNode node = GraphNode.newBuilder()
+                    .setNodeId("chunker-v1")
+                    .build();
+
+            String topic = resolveQuarantineTopic(node);
+
+            assertThat(topic, is("pipestream.test-cluster.chunker-v1.quarantine"));
+        }
+
+        private String resolveQuarantineTopic(GraphNode node) {
+            try {
+                Method method = DlqService.class.getDeclaredMethod("resolveQuarantineTopic", GraphNode.class);
+                method.setAccessible(true);
+                return (String) method.invoke(dlqService, node);
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to invoke resolveQuarantineTopic", e);
+            }
+        }
+    }
+
+    // ========== Exception Tests ==========
+
+    @Nested
+    @DisplayName("DLQ Exceptions")
+    class ExceptionTests {
+
+        @Test
+        @DisplayName("QuarantinedException should contain stream info")
+        void testQuarantinedException() {
+            DlqException.QuarantinedException ex =
+                    new DlqException.QuarantinedException("stream-123", 4, 3);
+
+            assertThat(ex.getStreamId(), is("stream-123"));
+            assertThat(ex.getReprocessCount(), is(4));
+            assertThat(ex.getMaxReprocessCount(), is(3));
+            assertThat(ex.getMessage(), containsString("stream-123"));
+            assertThat(ex.getMessage(), containsString("4/3"));
+        }
+
+        @Test
+        @DisplayName("AlreadyQuarantinedException should contain stream ID")
+        void testAlreadyQuarantinedException() {
+            DlqException.AlreadyQuarantinedException ex =
+                    new DlqException.AlreadyQuarantinedException("stream-456");
+
+            assertThat(ex.getStreamId(), is("stream-456"));
+            assertThat(ex.getMessage(), containsString("stream-456"));
+            assertThat(ex.getMessage(), containsString("already quarantined"));
+        }
+
+        @Test
+        @DisplayName("PublishException should contain topic and stream info")
+        void testPublishException() {
+            RuntimeException cause = new RuntimeException("Kafka connection failed");
+            DlqException.PublishException ex =
+                    new DlqException.PublishException("stream-789", "dlq-topic", cause);
+
+            assertThat(ex.getStreamId(), is("stream-789"));
+            assertThat(ex.getTopic(), is("dlq-topic"));
+            assertThat(ex.getCause(), is(cause));
+            assertThat(ex.getMessage(), containsString("stream-789"));
+            assertThat(ex.getMessage(), containsString("dlq-topic"));
+        }
+
+        @Test
+        @DisplayName("DlqDisabledException should contain node ID")
+        void testDlqDisabledException() {
+            DlqException.DlqDisabledException ex =
+                    new DlqException.DlqDisabledException("chunker-v1");
+
+            assertThat(ex.getNodeId(), is("chunker-v1"));
+            assertThat(ex.getMessage(), containsString("chunker-v1"));
+            assertThat(ex.getMessage(), containsString("disabled"));
+        }
+
+        @Test
+        @DisplayName("validateForReprocessing should throw for quarantined message")
+        void testValidateForReprocessingThrowsForQuarantined() {
+            DlqMessage quarantined = DlqMessage.newBuilder()
+                    .setStream(PipeStream.newBuilder().setStreamId("test-stream").build())
+                    .setQuarantined(true)
+                    .build();
+
+            assertThrows(DlqException.AlreadyQuarantinedException.class,
+                    () -> dlqService.validateForReprocessing(quarantined));
+        }
+
+        @Test
+        @DisplayName("validateForReprocessing should throw when reprocess count at max")
+        void testValidateForReprocessingThrowsAtMax() {
+            DlqMessage atMax = DlqMessage.newBuilder()
+                    .setStream(PipeStream.newBuilder().setStreamId("test-stream").build())
+                    .setDlqReprocessCount(3) // equals maxDlqReprocessCount
+                    .build();
+
+            assertThrows(DlqException.QuarantinedException.class,
+                    () -> dlqService.validateForReprocessing(atMax));
+        }
+
+        @Test
+        @DisplayName("validateForReprocessing should pass for valid message")
+        void testValidateForReprocessingPasses() {
+            DlqMessage valid = DlqMessage.newBuilder()
+                    .setStream(PipeStream.newBuilder().setStreamId("test-stream").build())
+                    .setDlqReprocessCount(1)
+                    .build();
+
+            // Should not throw
+            dlqService.validateForReprocessing(valid);
+        }
+    }
+
+    // ========== Reprocess Count Field Tests ==========
+
+    @Nested
+    @DisplayName("DLQ Reprocess Count Field")
+    class ReprocessCountTests {
+
+        @Test
+        @DisplayName("New DlqMessage should have zero reprocess count")
+        void testInitialReprocessCountIsZero() {
+            DlqConfig dlqConfig = DlqConfig.newBuilder()
+                    .setEnabled(true)
+                    .build();
+
+            GraphNode node = GraphNode.newBuilder()
+                    .setNodeId("test-node")
+                    .setDlqConfig(dlqConfig)
+                    .build();
+
+            PipeStream stream = PipeStream.newBuilder()
+                    .setStreamId("stream-1")
+                    .build();
+
+            DlqMessage message = buildDlqMessage(stream, node, new RuntimeException("Error"), dlqConfig);
+
+            assertThat(message.getDlqReprocessCount(), is(0));
+            assertFalse(message.getQuarantined());
+        }
+
+        @Test
+        @DisplayName("DlqMessage fields should be serializable")
+        void testNewFieldsSerialization() {
+            DlqMessage message = DlqMessage.newBuilder()
+                    .setDlqReprocessCount(2)
+                    .setQuarantined(true)
+                    .setQuarantinedAt(com.google.protobuf.util.Timestamps.fromMillis(System.currentTimeMillis()))
+                    .setStream(PipeStream.newBuilder().setStreamId("test").build())
+                    .build();
+
+            // Serialize and deserialize
+            byte[] bytes = message.toByteArray();
+            try {
+                DlqMessage deserialized = DlqMessage.parseFrom(bytes);
+
+                assertThat(deserialized.getDlqReprocessCount(), is(2));
+                assertTrue(deserialized.getQuarantined());
+                assertTrue(deserialized.hasQuarantinedAt());
+            } catch (Exception e) {
+                fail("Serialization/deserialization failed: " + e.getMessage());
+            }
         }
 
         private DlqMessage buildDlqMessage(PipeStream stream, GraphNode node,

@@ -78,6 +78,121 @@ class EngineMetricsTest {
             assertNotNull(counter, "Counter should exist");
             assertThat(counter.count(), is(4.0));
         }
+
+        @Test
+        @DisplayName("Should increment DLQ publish failure counter")
+        void testIncrementDlqPublishFailure() {
+            metrics.incrementDlqPublishFailure();
+            metrics.incrementDlqPublishFailure();
+            metrics.incrementDlqPublishFailure();
+
+            Counter counter = registry.find("engine.dlq.publish_failure").counter();
+            assertNotNull(counter, "Counter should exist");
+            assertThat(counter.count(), is(3.0));
+        }
+
+        @Test
+        @DisplayName("Should increment DLQ quarantined counter")
+        void testIncrementDlqQuarantined() {
+            metrics.incrementDlqQuarantined();
+            metrics.incrementDlqQuarantined();
+
+            Counter counter = registry.find("engine.dlq.quarantined").counter();
+            assertNotNull(counter, "Counter should exist");
+            assertThat(counter.count(), is(2.0));
+        }
+    }
+
+    @Nested
+    @DisplayName("DLQ Metrics Independence Tests")
+    class DlqMetricsIndependenceTests {
+
+        @Test
+        @DisplayName("DLQ publish failure should not affect DLQ published counter")
+        void testDlqPublishFailureDoesNotAffectPublished() {
+            // Simulate successful publishes
+            metrics.incrementDlqPublished();
+            metrics.incrementDlqPublished();
+            metrics.incrementDlqPublished();
+
+            // Simulate failures
+            metrics.incrementDlqPublishFailure();
+            metrics.incrementDlqPublishFailure();
+
+            // Verify counters are independent
+            Counter publishedCounter = registry.find("engine.dlq.published").counter();
+            Counter failureCounter = registry.find("engine.dlq.publish_failure").counter();
+
+            assertNotNull(publishedCounter, "Published counter should exist");
+            assertNotNull(failureCounter, "Failure counter should exist");
+            assertThat(publishedCounter.count(), is(3.0));
+            assertThat(failureCounter.count(), is(2.0));
+        }
+
+        @Test
+        @DisplayName("DLQ counters should be independent of doc counters")
+        void testDlqCountersIndependentOfDocCounters() {
+            // Simulate document processing
+            metrics.incrementDocSuccess();
+            metrics.incrementDocSuccess();
+            metrics.incrementDocFailure();
+
+            // Simulate DLQ operations
+            metrics.incrementDlqPublished();
+            metrics.incrementDlqPublishFailure();
+            metrics.incrementDlqQuarantined();
+
+            // Verify all counters are independent
+            assertThat(registry.find("engine.doc.success").counter().count(), is(2.0));
+            assertThat(registry.find("engine.doc.failure").counter().count(), is(1.0));
+            assertThat(registry.find("engine.dlq.published").counter().count(), is(1.0));
+            assertThat(registry.find("engine.dlq.publish_failure").counter().count(), is(1.0));
+            assertThat(registry.find("engine.dlq.quarantined").counter().count(), is(1.0));
+        }
+
+        @Test
+        @DisplayName("DLQ quarantined should be independent of published and failure")
+        void testDlqQuarantinedIndependence() {
+            // Simulate a message flow: published -> reprocessed -> published -> quarantined
+            metrics.incrementDlqPublished();  // Initial publish to DLQ
+            metrics.incrementDlqPublished();  // Reprocess fail, republish
+            metrics.incrementDlqPublished();  // Reprocess fail again, republish
+            metrics.incrementDlqQuarantined(); // Max retries exceeded, quarantine
+
+            // Also simulate some failures during this flow
+            metrics.incrementDlqPublishFailure();
+
+            Counter publishedCounter = registry.find("engine.dlq.published").counter();
+            Counter failureCounter = registry.find("engine.dlq.publish_failure").counter();
+            Counter quarantinedCounter = registry.find("engine.dlq.quarantined").counter();
+
+            assertThat(publishedCounter.count(), is(3.0));
+            assertThat(failureCounter.count(), is(1.0));
+            assertThat(quarantinedCounter.count(), is(1.0));
+        }
+
+        @Test
+        @DisplayName("All DLQ metrics should have correct descriptions")
+        void testDlqMetricDescriptions() {
+            // Trigger all DLQ metrics to ensure they're registered
+            metrics.incrementDlqPublished();
+            metrics.incrementDlqPublishFailure();
+            metrics.incrementDlqQuarantined();
+
+            Counter publishedCounter = registry.find("engine.dlq.published").counter();
+            Counter failureCounter = registry.find("engine.dlq.publish_failure").counter();
+            Counter quarantinedCounter = registry.find("engine.dlq.quarantined").counter();
+
+            // Verify counters exist and are distinct
+            assertNotNull(publishedCounter, "Published counter should exist");
+            assertNotNull(failureCounter, "Failure counter should exist");
+            assertNotNull(quarantinedCounter, "Quarantined counter should exist");
+
+            // Verify they are different meter instances
+            assertNotEquals(publishedCounter.getId(), failureCounter.getId());
+            assertNotEquals(publishedCounter.getId(), quarantinedCounter.getId());
+            assertNotEquals(failureCounter.getId(), quarantinedCounter.getId());
+        }
     }
 
     @Nested

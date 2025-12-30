@@ -9,6 +9,7 @@ import io.opentelemetry.api.trace.TraceState;
 import io.opentelemetry.context.Context;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
+import org.jboss.logging.Logger;
 import org.jboss.logging.MDC;
 
 /**
@@ -22,6 +23,8 @@ import org.jboss.logging.MDC;
  */
 @ApplicationScoped
 public class TracingContextService {
+
+    private static final Logger LOG = Logger.getLogger(TracingContextService.class);
 
     // MDC keys for log correlation
     public static final String MDC_TRACE_ID = "traceId";
@@ -137,9 +140,12 @@ public class TracingContextService {
      * <p>
      * This allows OpenTelemetry spans to be linked to an external trace
      * (e.g., from the original request that created the document).
+     * <p>
+     * The trace_id must be a valid W3C trace context format (32 lowercase hex characters).
+     * Invalid formats are logged as warnings for debugging purposes.
      *
      * @param stream The PipeStream containing trace metadata
-     * @return An OpenTelemetry Context for linking, or Context.root() if no trace_id
+     * @return An OpenTelemetry Context for linking, or Context.root() if no valid trace_id
      */
     public Context createLinkContext(PipeStream stream) {
         if (!stream.hasMetadata() || stream.getMetadata().getTraceId().isEmpty()) {
@@ -147,25 +153,64 @@ public class TracingContextService {
         }
 
         String traceId = stream.getMetadata().getTraceId();
+        String streamId = stream.getStreamId();
 
         // Validate trace_id format (should be 32 hex characters for W3C trace context)
-        if (traceId.length() == 32 && traceId.matches("[0-9a-fA-F]+")) {
-            try {
-                // Create a SpanContext from the trace_id
-                // Use a synthetic span_id since we only have trace_id
-                SpanContext linkedContext = SpanContext.create(
-                        traceId,
-                        "0000000000000000", // Synthetic span_id
-                        TraceFlags.getSampled(),
-                        TraceState.getDefault()
-                );
-                return Context.root().with(Span.wrap(linkedContext));
-            } catch (Exception e) {
-                // Invalid trace_id format, return root context
-                return Context.root();
-            }
+        if (!isValidW3CTraceId(traceId)) {
+            LOG.warnf("Invalid trace_id format for stream %s: '%s' (expected 32 hex characters, got %d chars). " +
+                      "Trace linking will be skipped. Ensure upstream services provide W3C-compliant trace IDs.",
+                    streamId, sanitizeTraceIdForLog(traceId), traceId.length());
+            return Context.root();
         }
 
-        return Context.root();
+        try {
+            // Create a SpanContext from the trace_id
+            // Use a synthetic span_id since we only have trace_id
+            SpanContext linkedContext = SpanContext.create(
+                    traceId.toLowerCase(), // W3C requires lowercase
+                    "0000000000000000", // Synthetic span_id
+                    TraceFlags.getSampled(),
+                    TraceState.getDefault()
+            );
+            return Context.root().with(Span.wrap(linkedContext));
+        } catch (Exception e) {
+            LOG.warnf(e, "Failed to create SpanContext from trace_id '%s' for stream %s: %s",
+                    sanitizeTraceIdForLog(traceId), streamId, e.getMessage());
+            return Context.root();
+        }
+    }
+
+    /**
+     * Validates if a trace_id conforms to W3C trace context format.
+     * <p>
+     * W3C trace context requires trace_id to be exactly 32 lowercase hexadecimal characters.
+     *
+     * @param traceId The trace_id to validate
+     * @return true if valid W3C format, false otherwise
+     */
+    private boolean isValidW3CTraceId(String traceId) {
+        if (traceId == null || traceId.length() != 32) {
+            return false;
+        }
+        // Check for valid hex characters (case-insensitive, will be lowercased)
+        return traceId.matches("[0-9a-fA-F]{32}");
+    }
+
+    /**
+     * Sanitizes a trace_id for safe logging.
+     * <p>
+     * Truncates very long values and escapes control characters to prevent log injection.
+     *
+     * @param traceId The trace_id to sanitize
+     * @return A safe string for logging
+     */
+    private String sanitizeTraceIdForLog(String traceId) {
+        if (traceId == null) {
+            return "<null>";
+        }
+        // Truncate if too long (shouldn't happen but defensive)
+        String safe = traceId.length() > 64 ? traceId.substring(0, 64) + "..." : traceId;
+        // Replace any control characters
+        return safe.replaceAll("[\\p{Cntrl}]", "?");
     }
 }

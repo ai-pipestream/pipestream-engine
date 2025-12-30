@@ -27,6 +27,7 @@ import java.util.UUID;
  * When document processing fails after all retry attempts, this service:
  * 1. Creates a DlqMessage with error metadata and the failed stream
  * 2. Publishes to the appropriate DLQ topic (node-specific or global)
+ * 3. Tracks reprocess attempts to prevent infinite retry loops for poison messages
  * <p>
  * DLQ topic naming convention:
  * - If node has {@code dlq_config.topic_override} → use that topic
@@ -39,6 +40,8 @@ import java.util.UUID;
  * - Failure timestamp
  * - Retry count
  * - Failed node ID
+ * - DLQ reprocess count (incremented on each replay from DLQ)
+ * - Quarantine status (when max reprocess attempts exceeded)
  */
 @ApplicationScoped
 public class DlqService {
@@ -47,6 +50,9 @@ public class DlqService {
 
     /** Default DLQ topic suffix when no override is configured. */
     private static final String DLQ_SUFFIX = ".dlq";
+
+    /** Quarantine topic suffix for poison messages that exceed max reprocess attempts. */
+    private static final String QUARANTINE_SUFFIX = ".quarantine";
 
     /** Global DLQ topic for nodes without DLQ config or pre-node failures. */
     @ConfigProperty(name = "pipestream.dlq.global-topic", defaultValue = "pipestream.global.dlq")
@@ -59,6 +65,10 @@ public class DlqService {
     /** Maximum retry attempts from config (used for retry_count in DlqMessage). */
     @ConfigProperty(name = "pipestream.module.retry.max-attempts", defaultValue = "3")
     int maxRetryAttempts;
+
+    /** Maximum times a message can be reprocessed from DLQ before being quarantined. */
+    @ConfigProperty(name = "pipestream.dlq.max-reprocess-count", defaultValue = "3")
+    int maxDlqReprocessCount;
 
     /** Emitter for publishing DlqMessage to DLQ topics. Uses dynamic topic routing. */
     @Inject
@@ -119,6 +129,113 @@ public class DlqService {
 
         DlqMessage dlqMessage = buildGlobalDlqMessage(stream, error, context);
         return publishMessage(dlqMessage, globalDlqTopic, stream.getStreamId());
+    }
+
+    /**
+     * Republishes a failed DLQ message after a reprocess attempt fails.
+     * <p>
+     * This method is called when a message that was replayed from the DLQ fails again.
+     * It increments the reprocess count and checks if the message should be quarantined.
+     *
+     * @param previousDlqMessage The original DLQ message that was being reprocessed
+     * @param node The node where reprocessing failed
+     * @param error The new error that occurred
+     * @return A Uni that completes when the message is published
+     */
+    public Uni<Void> republishAfterReprocessFailure(DlqMessage previousDlqMessage,
+                                                     GraphNode node, Throwable error) {
+        int newReprocessCount = previousDlqMessage.getDlqReprocessCount() + 1;
+
+        // Check if we've exceeded max reprocess attempts
+        if (newReprocessCount > maxDlqReprocessCount) {
+            return quarantineMessage(previousDlqMessage, node, error);
+        }
+
+        DlqConfig dlqConfig = node.getDlqConfig();
+        String dlqTopic = resolveDlqTopic(node, dlqConfig);
+        Timestamp now = Timestamps.fromMillis(Instant.now().toEpochMilli());
+
+        // Build updated DLQ message with incremented reprocess count
+        DlqMessage updatedMessage = previousDlqMessage.toBuilder()
+                .setDlqReprocessCount(newReprocessCount)
+                .setErrorType(classifyError(error))
+                .setErrorMessage(error.getMessage() != null ? error.getMessage() : "Unknown error")
+                .setFailedAt(now)
+                .setRetryCount(maxRetryAttempts)
+                .setFailedNodeId(node.getNodeId())
+                .build();
+
+        LOG.warnf("Republishing to DLQ after reprocess failure (attempt %d/%d) for stream %s (node: %s)",
+                newReprocessCount, maxDlqReprocessCount,
+                previousDlqMessage.getStream().getStreamId(), node.getNodeId());
+
+        return publishMessage(updatedMessage, dlqTopic, previousDlqMessage.getStream().getStreamId());
+    }
+
+    /**
+     * Checks if a DLQ message has exceeded the maximum reprocess attempts.
+     *
+     * @param dlqMessage The DLQ message to check
+     * @return true if the message should be quarantined, false otherwise
+     */
+    public boolean shouldQuarantine(DlqMessage dlqMessage) {
+        return dlqMessage.getDlqReprocessCount() >= maxDlqReprocessCount;
+    }
+
+    /**
+     * Checks if a DLQ message is already quarantined.
+     *
+     * @param dlqMessage The DLQ message to check
+     * @return true if the message is quarantined, false otherwise
+     */
+    public boolean isQuarantined(DlqMessage dlqMessage) {
+        return dlqMessage.getQuarantined();
+    }
+
+    /**
+     * Quarantines a poison message that has exceeded max reprocess attempts.
+     * <p>
+     * Quarantined messages are published to a separate quarantine topic and marked
+     * with the quarantined flag. They require manual intervention to fix.
+     *
+     * @param dlqMessage The DLQ message to quarantine
+     * @param node The node where the failure occurred
+     * @param error The error that triggered quarantine
+     * @return A Uni that completes when the message is quarantined
+     */
+    private Uni<Void> quarantineMessage(DlqMessage dlqMessage, GraphNode node, Throwable error) {
+        Timestamp now = Timestamps.fromMillis(Instant.now().toEpochMilli());
+        String quarantineTopic = resolveQuarantineTopic(node);
+
+        DlqMessage quarantinedMessage = dlqMessage.toBuilder()
+                .setDlqReprocessCount(dlqMessage.getDlqReprocessCount() + 1)
+                .setQuarantined(true)
+                .setQuarantinedAt(now)
+                .setErrorType(classifyError(error))
+                .setErrorMessage(String.format("QUARANTINED after %d reprocess attempts: %s",
+                        maxDlqReprocessCount,
+                        error.getMessage() != null ? error.getMessage() : "Unknown error"))
+                .setFailedAt(now)
+                .build();
+
+        LOG.errorf("QUARANTINING poison message for stream %s after %d failed reprocess attempts. " +
+                   "Manual intervention required. Quarantine topic: %s",
+                dlqMessage.getStream().getStreamId(), maxDlqReprocessCount, quarantineTopic);
+
+        // Increment quarantine metric
+        metrics.incrementDlqQuarantined();
+
+        return publishMessage(quarantinedMessage, quarantineTopic, dlqMessage.getStream().getStreamId());
+    }
+
+    /**
+     * Resolves the quarantine topic name for a given node.
+     *
+     * @param node The node configuration
+     * @return The quarantine topic name
+     */
+    private String resolveQuarantineTopic(GraphNode node) {
+        return String.format("pipestream.%s.%s%s", currentClusterId, node.getNodeId(), QUARANTINE_SUFFIX);
     }
 
     /**
@@ -270,6 +387,7 @@ public class DlqService {
      * @param topic The DLQ topic name
      * @param streamId The stream ID for key generation
      * @return A Uni that completes when the message is published
+     * @throws DlqException.PublishException if publishing fails
      */
     private Uni<Void> publishMessage(DlqMessage dlqMessage, String topic, String streamId) {
         // Generate deterministic key from stream ID
@@ -294,7 +412,34 @@ public class DlqService {
             return Uni.createFrom().voidItem();
         } catch (Exception e) {
             LOG.errorf(e, "Failed to publish DLQ message to topic %s", topic);
-            return Uni.createFrom().failure(e);
+            // Record DLQ publish failure metric
+            metrics.incrementDlqPublishFailure();
+            return Uni.createFrom().failure(new DlqException.PublishException(streamId, topic, e));
+        }
+    }
+
+    /**
+     * Validates that a DLQ message can be reprocessed.
+     * <p>
+     * Throws appropriate exceptions if the message is already quarantined
+     * or should be quarantined based on reprocess count.
+     *
+     * @param dlqMessage The DLQ message to validate
+     * @throws DlqException.AlreadyQuarantinedException if message is already quarantined
+     * @throws DlqException.QuarantinedException if message should be quarantined
+     */
+    public void validateForReprocessing(DlqMessage dlqMessage) {
+        String streamId = dlqMessage.hasStream() ? dlqMessage.getStream().getStreamId() : "unknown";
+
+        if (isQuarantined(dlqMessage)) {
+            throw new DlqException.AlreadyQuarantinedException(streamId);
+        }
+
+        if (shouldQuarantine(dlqMessage)) {
+            throw new DlqException.QuarantinedException(
+                    streamId,
+                    dlqMessage.getDlqReprocessCount(),
+                    maxDlqReprocessCount);
         }
     }
 }

@@ -30,6 +30,8 @@ public class EngineMetrics {
     private final Counter docSuccessCounter;
     private final Counter docFailureCounter;
     private final Counter dlqPublishedCounter;
+    private final Counter dlqPublishFailureCounter;
+    private final Counter dlqQuarantinedCounter;
     private final Counter routingCounter;
 
     // Timers
@@ -57,6 +59,14 @@ public class EngineMetrics {
 
         this.dlqPublishedCounter = Counter.builder("engine.dlq.published")
                 .description("Number of documents published to DLQ")
+                .register(registry);
+
+        this.dlqPublishFailureCounter = Counter.builder("engine.dlq.publish_failure")
+                .description("Number of failed attempts to publish to DLQ (network issues, Kafka downtime, etc.)")
+                .register(registry);
+
+        this.dlqQuarantinedCounter = Counter.builder("engine.dlq.quarantined")
+                .description("Number of poison messages quarantined after exceeding max reprocess attempts")
                 .register(registry);
 
         this.routingCounter = Counter.builder("engine.routing.dispatched")
@@ -102,6 +112,22 @@ public class EngineMetrics {
      */
     public void incrementDlqPublished() {
         dlqPublishedCounter.increment();
+    }
+
+    /**
+     * Increments the DLQ publish failure counter.
+     * Called when publishing to DLQ fails (network issues, Kafka downtime, etc.).
+     */
+    public void incrementDlqPublishFailure() {
+        dlqPublishFailureCounter.increment();
+    }
+
+    /**
+     * Increments the DLQ quarantined counter.
+     * Called when a poison message exceeds max reprocess attempts.
+     */
+    public void incrementDlqQuarantined() {
+        dlqQuarantinedCounter.increment();
     }
 
     /**
