@@ -13,6 +13,7 @@ import ai.pipestream.data.v1.ProcessConfiguration;
 import ai.pipestream.data.v1.StepExecutionRecord;
 import ai.pipestream.engine.graph.GraphCache;
 import ai.pipestream.engine.hydration.RepoClient;
+import ai.pipestream.engine.mapping.MappingEngine;
 import ai.pipestream.engine.module.ModuleCapabilityService;
 import ai.pipestream.engine.routing.CelEvaluatorService;
 import ai.pipestream.engine.v1.*;
@@ -66,6 +67,10 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
     /** Injected service for querying module capabilities to determine hydration requirements. */
     @Inject
     ModuleCapabilityService capabilityService;
+
+    /** Injected engine for applying field mappings before/after module processing. */
+    @Inject
+    MappingEngine mappingEngine;
 
     /** Injected factory for creating dynamic gRPC clients for module communication. */
     @Inject
@@ -124,25 +129,138 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
      * <p>
      * The processing follows this sequence:
      * 1. Ensure document is hydrated to required level
-     * 2. Call the configured module for processing
-     * 3. Update stream metadata and execution history
-     * 4. Route the result to next nodes in the graph
+     * 2. Evaluate filter conditions - skip if any evaluates to false
+     * 3. Apply pre-mappings to transform document before module call
+     * 4. Call the configured module for processing
+     * 5. Apply post-mappings to transform document after module call
+     * 6. Update stream metadata and execution history
+     * 7. Route the result to next nodes in the graph
      *
      * @param stream The input stream to process
      * @param node The graph node configuration defining the processing logic
      * @return A Uni that completes with the processed stream
      */
     private Uni<PipeStream> processNodeLogic(PipeStream stream, GraphNode node) {
-        // 3. Hydrate (Level 2) if needed
+        // 1. Hydrate (Level 1 & 2) if needed
         return ensureHydration(stream, node)
-            .flatMap(hydratedStream -> callModule(hydratedStream, node))
-            .flatMap(resultDoc -> {
-                // 5. Update Metadata & History
-                PipeStream updatedStream = updateStreamMetadata(stream, resultDoc, node);
-                
-                // 6. Route to Next
-                return routeToNextNodes(updatedStream, node);
+            .flatMap(hydratedStream -> {
+                // 2. Evaluate filter conditions - all must pass
+                if (!evaluateFilterConditions(hydratedStream, node)) {
+                    LOG.debugf("Stream %s skipped at node %s - filter condition not met",
+                            hydratedStream.getStreamId(), node.getNodeId());
+                    // Skip this node, route directly to next nodes without processing
+                    return routeToNextNodes(hydratedStream, node);
+                }
+
+                // 3. Apply pre-mappings
+                return applyPreMappings(hydratedStream, node)
+                    // 4. Call module
+                    .flatMap(preMappedStream -> callModule(preMappedStream, node)
+                        // 5. Apply post-mappings
+                        .flatMap(resultDoc -> applyPostMappings(resultDoc, preMappedStream, node)))
+                    .flatMap(postMappedDoc -> {
+                        // 6. Update Metadata & History
+                        PipeStream updatedStream = updateStreamMetadata(hydratedStream, postMappedDoc, node);
+
+                        // 7. Route to Next
+                        return routeToNextNodes(updatedStream, node);
+                    });
+            })
+            .onFailure().recoverWithUni(error -> {
+                // Handle save_on_error behavior
+                if (node.getSaveOnError() && stream.hasDocument()) {
+                    LOG.warnf("Module %s failed, saving document due to save_on_error=true: %s",
+                            node.getModuleId(), error.getMessage());
+                    return saveErrorState(stream, node, error)
+                            .flatMap(v -> Uni.createFrom().failure(error));
+                }
+                return Uni.createFrom().failure(error);
             });
+    }
+
+    /**
+     * Evaluates all filter conditions for a node.
+     * <p>
+     * All conditions must evaluate to true for the document to be processed.
+     * If any condition evaluates to false, the document skips this node.
+     * An empty filter list means no filtering (document is processed).
+     *
+     * @param stream The stream to evaluate conditions against
+     * @param node The node containing filter conditions
+     * @return true if all conditions pass (or no conditions), false otherwise
+     */
+    private boolean evaluateFilterConditions(PipeStream stream, GraphNode node) {
+        if (node.getFilterConditionsCount() == 0) {
+            return true; // No filters, process the document
+        }
+
+        for (String condition : node.getFilterConditionsList()) {
+            if (condition == null || condition.isBlank()) {
+                continue; // Skip empty conditions
+            }
+            if (!celEvaluator.evaluate(condition, stream)) {
+                LOG.debugf("Filter condition failed: %s", condition);
+                return false;
+            }
+        }
+        return true; // All conditions passed
+    }
+
+    /**
+     * Applies pre-mappings to transform the document before module processing.
+     *
+     * @param stream The input stream
+     * @param node The node containing pre-mapping configuration
+     * @return A Uni with the stream containing the transformed document
+     */
+    private Uni<PipeStream> applyPreMappings(PipeStream stream, GraphNode node) {
+        if (node.getPreMappingsCount() == 0 || !stream.hasDocument()) {
+            return Uni.createFrom().item(stream);
+        }
+
+        return mappingEngine.applyMappings(stream.getDocument(), node.getPreMappingsList(), stream)
+                .map(mappedDoc -> stream.toBuilder().setDocument(mappedDoc).build());
+    }
+
+    /**
+     * Applies post-mappings to transform the document after module processing.
+     *
+     * @param resultDoc The document returned from the module
+     * @param stream The original stream (for CEL context)
+     * @param node The node containing post-mapping configuration
+     * @return A Uni with the transformed document
+     */
+    private Uni<PipeDoc> applyPostMappings(PipeDoc resultDoc, PipeStream stream, GraphNode node) {
+        if (node.getPostMappingsCount() == 0) {
+            return Uni.createFrom().item(resultDoc);
+        }
+
+        // Create updated stream context with the result document for CEL evaluation
+        PipeStream updatedContext = stream.toBuilder().setDocument(resultDoc).build();
+        return mappingEngine.applyMappings(resultDoc, node.getPostMappingsList(), updatedContext);
+    }
+
+    /**
+     * Saves document state when processing fails and save_on_error is enabled.
+     *
+     * @param stream The stream containing the document to save
+     * @param node The node where processing failed
+     * @param error The error that occurred
+     * @return A Uni that completes when the document is saved
+     */
+    private Uni<Void> saveErrorState(PipeStream stream, GraphNode node, Throwable error) {
+        if (!stream.hasDocument()) {
+            return Uni.createFrom().voidItem();
+        }
+
+        String accountId = stream.getMetadata().getAccountId();
+        String graphLocationId = node.getNodeId() + ".error";
+
+        return repoClient.savePipeDoc(stream.getDocument(), accountId, graphLocationId, currentClusterId)
+                .replaceWithVoid()
+                .onFailure().invoke(saveError ->
+                        LOG.errorf(saveError, "Failed to save error state for stream %s at node %s",
+                                stream.getStreamId(), node.getNodeId()));
     }
 
     /**
