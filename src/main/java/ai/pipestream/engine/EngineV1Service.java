@@ -553,9 +553,11 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                         .build())
                 .build();
 
-        // Resolve service name from graph cache (reactive) and call module
-        return graphCache.getModule(moduleId)
+        // Validate module is registered before calling, then get the module definition
+        return graphValidationService.validateModuleRegistered(moduleId)
+            .flatMap(v -> graphCache.getModule(moduleId))
             .map(moduleOpt -> {
+                // After validation, moduleOpt should be present, but handle gracefully
                 return moduleOpt
                     .map(ModuleDefinition::getGrpcServiceName)
                     .filter(s -> !s.isEmpty())

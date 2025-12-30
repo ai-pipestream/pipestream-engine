@@ -1,7 +1,12 @@
 package ai.pipestream.engine.routing;
 
+import ai.pipestream.config.v1.GraphEdge;
+import ai.pipestream.config.v1.GraphNode;
+import ai.pipestream.config.v1.PipelineGraph;
 import ai.pipestream.data.v1.PipeDoc;
+import ai.pipestream.data.v1.ProcessingMapping;
 import ai.pipestream.data.v1.PipeStream;
+import ai.pipestream.engine.graph.GraphLoadedEvent;
 import dev.cel.bundle.Cel;
 import dev.cel.bundle.CelFactory;
 import dev.cel.common.CelAbstractSyntaxTree;
@@ -10,8 +15,11 @@ import dev.cel.common.types.SimpleType;
 import dev.cel.runtime.CelRuntime;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.ObservesAsync;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import org.jboss.logging.Logger;
 
@@ -131,14 +139,140 @@ public class CelEvaluatorService {
      *
      * @param expression The CEL expression string to compile
      * @return The compiled abstract syntax tree ready for evaluation
-     * @throws RuntimeException if the expression is invalid or cannot be compiled
+     * @throws InvalidCelExpressionException if the expression is invalid or cannot be compiled
      */
     private CelAbstractSyntaxTree compile(String expression) {
         try {
             return cel.compile(expression).getAst();
         } catch (CelValidationException e) {
             LOG.errorf("Invalid CEL expression: %s", expression, e);
-            throw new RuntimeException("Invalid CEL expression: " + expression, e);
+            throw new InvalidCelExpressionException(expression, e);
         }
+    }
+
+    /**
+     * Asynchronously warms up the CEL cache when a new graph is loaded.
+     * <p>
+     * This observer is triggered asynchronously via CDI events to avoid blocking
+     * the graph swap operation. It pre-compiles all CEL expressions found in the graph:
+     * - Edge conditions (routing logic)
+     * - Node filter conditions (pre-processing filters)
+     * - Pre-mapping CEL expressions (field transformations)
+     * - Post-mapping CEL expressions (field transformations)
+     * <p>
+     * Pre-compiling avoids latency spikes on the first document processed after a graph update.
+     *
+     * @param event The graph loaded event containing the new pipeline graph
+     */
+    void onGraphLoaded(@ObservesAsync GraphLoadedEvent event) {
+        PipelineGraph graph = event.getGraph();
+        LOG.infof("CEL cache warmup started for graph %s (version %d -> %d)",
+                graph.getGraphId(), event.getPreviousVersion(), event.getNewVersion());
+
+        long startTime = System.currentTimeMillis();
+        Set<String> expressions = collectCelExpressions(graph);
+
+        int compiled = 0;
+        int cached = 0;
+        int failed = 0;
+
+        for (String expression : expressions) {
+            if (expression == null || expression.isBlank()) {
+                continue;
+            }
+
+            // Check if already cached
+            if (scriptCache.containsKey(expression)) {
+                cached++;
+                continue;
+            }
+
+            // Compile and cache
+            try {
+                scriptCache.computeIfAbsent(expression, this::compile);
+                compiled++;
+            } catch (Exception e) {
+                LOG.warnf("Failed to pre-compile CEL expression during warmup: %s - %s",
+                        expression, e.getMessage());
+                failed++;
+            }
+        }
+
+        long duration = System.currentTimeMillis() - startTime;
+        LOG.infof("CEL cache warmup completed: %d expressions compiled, %d already cached, %d failed (%d ms)",
+                compiled, cached, failed, duration);
+    }
+
+    /**
+     * Collects all CEL expressions from the graph that need to be pre-compiled.
+     * <p>
+     * Scans through all nodes and edges to find:
+     * - Edge conditions
+     * - Node filter conditions
+     * - Pre-mapping expressions
+     * - Post-mapping expressions
+     *
+     * @param graph The pipeline graph to scan
+     * @return A set of unique CEL expression strings
+     */
+    private Set<String> collectCelExpressions(PipelineGraph graph) {
+        Set<String> expressions = new HashSet<>();
+
+        // Collect edge conditions
+        for (GraphEdge edge : graph.getEdgesList()) {
+            String condition = edge.getCondition();
+            if (condition != null && !condition.isBlank()) {
+                expressions.add(condition);
+            }
+        }
+
+        // Collect node filter conditions and mapping expressions
+        for (GraphNode node : graph.getNodesList()) {
+            // Filter conditions
+            for (String filter : node.getFilterConditionsList()) {
+                if (filter != null && !filter.isBlank()) {
+                    expressions.add(filter);
+                }
+            }
+
+            // Pre-mappings (CEL expressions in cel_config)
+            for (ProcessingMapping mapping : node.getPreMappingsList()) {
+                if (mapping.hasCelConfig()) {
+                    String expr = mapping.getCelConfig().getExpression();
+                    if (expr != null && !expr.isBlank()) {
+                        expressions.add(expr);
+                    }
+                }
+            }
+
+            // Post-mappings (CEL expressions in cel_config)
+            for (ProcessingMapping mapping : node.getPostMappingsList()) {
+                if (mapping.hasCelConfig()) {
+                    String expr = mapping.getCelConfig().getExpression();
+                    if (expr != null && !expr.isBlank()) {
+                        expressions.add(expr);
+                    }
+                }
+            }
+        }
+
+        return expressions;
+    }
+
+    /**
+     * Returns the current cache size for monitoring/testing purposes.
+     *
+     * @return The number of compiled expressions in the cache
+     */
+    public int getCacheSize() {
+        return scriptCache.size();
+    }
+
+    /**
+     * Clears the script cache. Primarily for testing.
+     */
+    public void clearCache() {
+        scriptCache.clear();
+        LOG.debug("CEL script cache cleared");
     }
 }

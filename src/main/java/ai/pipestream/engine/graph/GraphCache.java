@@ -6,6 +6,8 @@ import ai.pipestream.config.v1.ModuleDefinition;
 import ai.pipestream.config.v1.PipelineGraph;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Event;
+import jakarta.inject.Inject;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -32,6 +34,10 @@ public class GraphCache {
 
     /** Logger for this service class. */
     private static final Logger LOG = Logger.getLogger(GraphCache.class);
+
+    /** CDI event for notifying observers when a graph is loaded. */
+    @Inject
+    Event<GraphLoadedEvent> graphLoadedEvent;
 
     /** Current graph version - volatile ensures all threads see updates immediately. */
     private volatile long currentVersion = 0L;
@@ -87,6 +93,9 @@ public class GraphCache {
     public void rebuild(PipelineGraph graph) {
         LOG.infof("Rebuilding graph cache: %s (Version: %d)", graph.getName(), graph.getVersion());
 
+        // Capture previous version for event notification
+        long previousVersion = this.currentVersion;
+
         // Extract and index embedded nodes
         Map<String, GraphNode> newNodeMap = new ConcurrentHashMap<>();
         for (GraphNode node : graph.getNodesList()) {
@@ -138,6 +147,16 @@ public class GraphCache {
 
         LOG.infof("Graph cache rebuilt successfully: %d nodes, %d edge groups, %d modules, version %d",
                 newNodeMap.size(), unmodifiableEdgesMap.size(), this.moduleMap.size(), graph.getVersion());
+
+        // Fire async event to notify observers (e.g., CEL cache warmup)
+        // Using fireAsync to avoid blocking the graph swap operation
+        GraphLoadedEvent event = new GraphLoadedEvent(graph, previousVersion, graph.getVersion());
+        graphLoadedEvent.fireAsync(event)
+                .thenAccept(e -> LOG.debugf("GraphLoadedEvent processed: %s", e))
+                .exceptionally(error -> {
+                    LOG.warnf("Error processing GraphLoadedEvent: %s", error.getMessage());
+                    return null;
+                });
     }
 
     /**
