@@ -9,6 +9,7 @@ import ai.pipestream.data.v1.BlobBag;
 import ai.pipestream.data.v1.DocumentReference;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.PipeStream;
+import ai.pipestream.data.v1.ProcessConfiguration;
 import ai.pipestream.data.v1.StepExecutionRecord;
 import ai.pipestream.engine.graph.GraphCache;
 import ai.pipestream.engine.hydration.RepoClient;
@@ -291,8 +292,19 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                 .filter(s -> !s.isEmpty())
                 .orElse(moduleId);
 
+        // Build ProcessConfiguration from GraphNode's custom_config
+        ProcessConfiguration.Builder configBuilder = ProcessConfiguration.newBuilder();
+        if (node.hasCustomConfig()) {
+            ProcessConfiguration nodeConfig = node.getCustomConfig();
+            if (nodeConfig.hasJsonConfig()) {
+                configBuilder.setJsonConfig(nodeConfig.getJsonConfig());
+            }
+            configBuilder.putAllConfigParams(nodeConfig.getConfigParamsMap());
+        }
+
         ProcessDataRequest request = ProcessDataRequest.newBuilder()
                 .setDocument(stream.getDocument())
+                .setConfig(configBuilder.build())
                 .setMetadata(ServiceMetadata.newBuilder()
                         .setStreamId(stream.getStreamId())
                         .setCurrentHopNumber(stream.getHopCount())
