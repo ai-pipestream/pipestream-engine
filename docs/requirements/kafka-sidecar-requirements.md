@@ -6,6 +6,14 @@ The Kafka Sidecar is a specialized service that bridges asynchronous Kafka messa
 
 **Repository**: [pipestream-engine-kafka-sidecar](https://github.com/ai-pipestream/pipestream-engine-kafka-sidecar)
 
+**Status Summary** (as of 2025-12-30):
+- ✅ **Phase 1 Complete**: Core consumption, lease management, hydration, gRPC handoff, retry logic
+- ⚠️ **Phase 2 Partial**: Node topics done, DLQ publishing pending (blocking FR6.1 completion)
+- ❌ **Phase 3 Not Started**: Metrics, tracing, health checks, circuit breakers
+- ❌ **Phase 4 Not Started**: Advanced features (batching, rate limiting, priority queues)
+
+**Key Blocking Issue**: FR5 (DLQ Publishing) must be implemented to properly complete FR6.1 (commit offset only after success/DLQ).
+
 **Related Documentation**:
 - [Engine Architecture: Kafka Sidecar Pattern](../../docs/architecture/08-kafka-sidecar.md)
 - [Engine Architecture: Hydration Model](../../docs/architecture/05-hydration-model.md)
@@ -24,54 +32,54 @@ The Kafka Sidecar is a specialized service that bridges asynchronous Kafka messa
 
 ## Functional Requirements
 
-### FR1: Topic Consumption
+### FR1: Topic Consumption ✅ **DONE**
 
-#### FR1.1: Intake Topics
+#### FR1.1: Intake Topics ✅
 - **Pattern**: `intake.{datasource_id}`
 - **Publisher**: Repository Service
 - **Engine Endpoint**: `IntakeHandoff()`
 - **Purpose**: Initial document ingestion into the system
 - **Message Format**: `PipeStream` containing `DocumentReference` (not full `PipeDoc`)
 
-#### FR1.2: Node Topics
+#### FR1.2: Node Topics ✅
 - **Pattern**: `pipestream.{cluster}.{node_id}`
 - **Publisher**: Engine (via Repository Service)
 - **Engine Endpoint**: `ProcessNode()`
 - **Purpose**: Inter-node routing for async pipeline steps
 - **Message Format**: `PipeStream` containing `DocumentReference` (not full `PipeDoc`)
 
-#### FR1.3: Message Schema
+#### FR1.3: Message Schema ✅
 - **Key**: UUID (string representation) for deterministic partitioning
 - **Value**: `PipeStream` protobuf message
 - **Headers**: Optional metadata (account_id, request_id, etc.)
 
-### FR2: Lease Management via Consul
+### FR2: Lease Management via Consul ✅ **DONE**
 
-#### FR2.1: Service Registration
+#### FR2.1: Service Registration ✅
 - Register a Consul session upon startup
 - Maintain session health (heartbeat)
 - Release all leases on graceful shutdown
 
-#### FR2.2: Topic Discovery
+#### FR2.2: Topic Discovery ✅
 - Poll Consul KV store for available topics:
   - `pipestream/intake-topics/{datasource_id}`
   - `pipestream/node-topics/{cluster_id}.{node_id}`
 - Support dynamic topic addition/removal (polling interval configurable)
 
-#### FR2.3: Lock Acquisition
+#### FR2.3: Lock Acquisition ✅
 - Attempt to acquire ephemeral KV lock for each discovered topic
 - Lock key format: `pipestream/locks/{topic_name}`
 - Lock linked to Consul session (auto-released on session expiry)
 - Support maximum leases per sidecar (configurable, default: 50)
 
-#### FR2.4: Lease Persistence
+#### FR2.4: Lease Persistence ✅
 - Maintain lock as long as Consul session is active
 - Automatically release lock on session expiry (sidecar failure)
 - Re-acquire leases on session renewal
 
-### FR3: Level 1 Hydration
+### FR3: Level 1 Hydration ✅ **DONE**
 
-#### FR3.1: DocumentReference Resolution
+#### FR3.1: DocumentReference Resolution ✅
 - Extract `DocumentReference` from `PipeStream`
 - Call Repository Service: `GetPipeDocByReference()`
 - Parameters:
@@ -79,19 +87,19 @@ The Kafka Sidecar is a specialized service that bridges asynchronous Kafka messa
   - `graph_location_id` (from `DocumentReference.source_node_id`)
   - `account_id` (from `DocumentReference.account_id`)
 
-#### FR3.2: Hydrated Stream Construction
+#### FR3.2: Hydrated Stream Construction ✅
 - Replace `DocumentReference` with full `PipeDoc` in `PipeStream`
 - Preserve all `PipeStream` metadata (hop_count, processing_path, etc.)
 - Handle hydration failures (retry with backoff, then DLQ)
 
-#### FR3.3: Repository Service Client
+#### FR3.3: Repository Service Client ✅
 - Use reactive gRPC client (Mutiny) for Repository Service
 - Support service discovery (Consul or static configuration)
 - Handle connection failures and retries
 
-### FR4: gRPC Handoff to Engine
+### FR4: gRPC Handoff to Engine ✅ **DONE**
 
-#### FR4.1: Intake Handoff
+#### FR4.1: Intake Handoff ✅
 - **Endpoint**: `EngineV1Service.IntakeHandoff()`
 - **Request**:
   ```protobuf
@@ -104,7 +112,7 @@ The Kafka Sidecar is a specialized service that bridges asynchronous Kafka messa
 - Extract `datasource_id` from topic name (`intake.{datasource_id}`)
 - Set `doc_stored_in_repo = true` (document already persisted)
 
-#### FR4.2: Process Node
+#### FR4.2: Process Node ✅
 - **Endpoint**: `EngineV1Service.ProcessNode()`
 - **Request**:
   ```protobuf
@@ -114,20 +122,20 @@ The Kafka Sidecar is a specialized service that bridges asynchronous Kafka messa
   ```
 - Extract target node from topic name or `PipeStream.current_node_id`
 
-#### FR4.3: Engine Client
+#### FR4.3: Engine Client ✅
 - Use reactive gRPC client (Mutiny) for Engine
 - Default to `localhost` (sidecar runs alongside Engine)
 - Support configurable Engine address for testing/debugging
 - Handle Engine unavailability (retry with backoff, then DLQ)
 
-### FR5: Dead Letter Queue (DLQ) Publishing
+### FR5: Dead Letter Queue (DLQ) Publishing ❌ **NOT DONE**
 
-#### FR5.1: DLQ Topic Naming
+#### FR5.1: DLQ Topic Naming ❌
 - **Pattern**: `dlq.{cluster_id}.{node_id}`
 - Extract cluster and node from original topic or `PipeStream`
 - Create DLQ topic if it doesn't exist (via Kafka admin client)
 
-#### FR5.2: DLQ Message Schema
+#### FR5.2: DLQ Message Schema ❌
 ```protobuf
 message DlqMessage {
   PipeStream stream = 1;                    // Dehydrated (DocumentReference only)
@@ -142,38 +150,44 @@ message DlqMessage {
 }
 ```
 
-#### FR5.3: DLQ Publishing Triggers
+#### FR5.3: DLQ Publishing Triggers ❌
 - Engine returns `ProcessNodeResponse.success = false` after retries exhausted
 - Engine unreachable (connection refused, timeout)
 - Hydration failure after retries exhausted
 - Invalid message format (malformed protobuf)
 
-#### FR5.4: Offset Commitment After DLQ
+#### FR5.4: Offset Commitment After DLQ ❌
 - Commit offset **after** successful DLQ publish
 - Ensures poison messages don't block pipeline
 - Log DLQ publish for monitoring/alerting
 
-### FR6: Offset Management
+**Status**: TODO present in `ConsumerManager.java` line 213. Currently commits on failure to avoid infinite retry loop.
 
-#### FR6.1: Manual Offset Commits
+### FR6: Offset Management ⚠️ **PARTIAL**
+
+#### FR6.1: Manual Offset Commits ⚠️
 - Commit offsets **only** after successful Engine processing
 - Use `commitSync()` for at-least-once delivery guarantee
 - Commit per message (not batch) for precise progress tracking
 
-#### FR6.2: Offset Storage
+**Status**: Currently commits on terminal failure (to avoid infinite loop). Requirement not fully met until DLQ (FR5) is implemented.
+
+#### FR6.2: Offset Storage ✅
 - Use Kafka's built-in offset storage (consumer group)
 - Consumer group ID: `pipestream-sidecar` (configurable)
 - Support offset reset policies (earliest, latest, none)
 
-#### FR6.3: Failure Handling
+#### FR6.3: Failure Handling ⚠️
 - **Before commit**: Message will be re-processed by next sidecar to acquire lease
 - **After commit**: Message is considered processed (even if Engine failed)
   - Failed messages go to DLQ before commit
   - Ensures no message loss
 
-### FR7: Retry Logic
+**Status**: Partial - commits on failure currently. Will be complete once FR5 (DLQ) is implemented.
 
-#### FR7.1: Retry Configuration
+### FR7: Retry Logic ✅ **DONE**
+
+#### FR7.1: Retry Configuration ✅
 - Maximum retries: 3 (configurable per topic/node)
 - Backoff strategy: Exponential (configurable)
 - Retryable errors:
@@ -181,12 +195,12 @@ message DlqMessage {
   - Repository Service unavailable
   - Transient network errors
 
-#### FR7.2: Retry Tracking
+#### FR7.2: Retry Tracking ✅
 - Track retry count per message (in-memory or via message headers)
 - Log retry attempts for monitoring
 - Exhaust retries before DLQ publishing
 
-#### FR7.3: Non-Retryable Errors
+#### FR7.3: Non-Retryable Errors ✅
 - Invalid message format (malformed protobuf)
 - Logical failures (Engine returns success=false with logical error)
   - These are valid processing outcomes, not infrastructure failures
@@ -205,20 +219,24 @@ message DlqMessage {
 - **Fault Tolerance**: Automatic lease release on failure (via Consul session expiry)
 - **Message Guarantee**: At-least-once delivery (via manual offset commits)
 
-### NFR3: Observability
-- **Metrics**:
-  - Messages consumed per topic
-  - Hydration latency (p50, p95, p99)
-  - Engine handoff latency
-  - DLQ publish count
-  - Retry count histogram
-  - Active lease count
-  - Offset lag per topic
-- **Logging**:
-  - Structured logging (JSON format)
-  - Log level: INFO (default), DEBUG (configurable)
-  - Include: topic, partition, offset, doc_id, account_id, request_id
-- **Tracing**: Support distributed tracing (OpenTelemetry/Jaeger)
+### NFR3: Observability ⚠️ **PARTIAL**
+
+#### Metrics ❌ **NOT DONE**
+- Messages consumed per topic
+- Hydration latency (p50, p95, p99)
+- Engine handoff latency
+- DLQ publish count (pending FR5)
+- Retry count histogram
+- Active lease count
+- Offset lag per topic
+
+#### Logging ✅ **DONE**
+- Structured logging (JSON format)
+- Log level: INFO (default), DEBUG (configurable)
+- Include: topic, partition, offset, doc_id, account_id, request_id
+
+#### Tracing ❌ **NOT DONE**
+- Support distributed tracing (OpenTelemetry/Jaeger)
 
 ### NFR4: Scalability
 - **Horizontal Scaling**: Multiple sidecars can run in parallel
@@ -251,38 +269,40 @@ message DlqMessage {
 - **Engine**: Default `localhost:9090` (configurable)
 - **Consul**: Via Consul agent (typically localhost:8500)
 
-### TR4: Error Handling
-- **Graceful Degradation**: Continue processing other topics if one fails
-- **Circuit Breaker**: Implement circuit breaker for Engine/Repo Service calls
-- **Timeout Configuration**: Configurable timeouts for all external calls
+### TR4: Error Handling ⚠️ **PARTIAL**
+- **Graceful Degradation**: Continue processing other topics if one fails ✅
+- **Circuit Breaker**: Implement circuit breaker for Engine/Repo Service calls ❌
+- **Timeout Configuration**: Configurable timeouts for all external calls ✅
 
 ## Implementation Phases
 
-### Phase 1: Core Consumption (MVP)
-- [ ] Consul session management
-- [ ] Topic discovery and lease acquisition
-- [ ] Kafka consumer setup (intake topics only)
-- [ ] Level 1 hydration
-- [ ] Engine gRPC handoff (IntakeHandoff)
-- [ ] Offset management
-- [ ] Basic error handling
+### Phase 1: Core Consumption (MVP) ✅ **COMPLETE**
+- [x] Consul session management
+- [x] Topic discovery and lease acquisition
+- [x] Kafka consumer setup (intake topics only)
+- [x] Level 1 hydration
+- [x] Engine gRPC handoff (IntakeHandoff)
+- [x] Offset management (manual commits implemented; see FR6.1 note)
+- [x] Basic error handling
 
-### Phase 2: Node Topics & DLQ
-- [ ] Node topic consumption
-- [ ] ProcessNode gRPC handoff
-- [ ] DLQ publishing
-- [ ] Retry logic with backoff
-- [ ] Enhanced error handling
+### Phase 2: Node Topics & DLQ ⚠️ **PARTIAL**
+- [x] Node topic consumption
+- [x] ProcessNode gRPC handoff
+- [ ] DLQ publishing ❌ (TODO in ConsumerManager.java line 213)
+- [x] Retry logic with backoff
+- [x] Enhanced error handling (partial - needs DLQ for complete solution)
 
-### Phase 3: Observability & Hardening
+**Note**: Phase 2 blocking issue: DLQ publishing must be implemented to meet FR6.1 requirement (commit only after success/DLQ).
+
+### Phase 3: Observability & Hardening ❌ **NOT STARTED**
 - [ ] Metrics collection (Prometheus)
 - [ ] Distributed tracing
-- [ ] Health checks
+- [ ] Health checks (stub exists with TODO in SidecarHealthCheck.java line 28)
 - [ ] Circuit breakers
 - [ ] Configuration management
 - [ ] Documentation
 
-### Phase 4: Advanced Features
+### Phase 4: Advanced Features ❌ **NOT STARTED**
 - [ ] Batch processing (configurable)
 - [ ] Rate limiting
 - [ ] Priority queues
@@ -290,19 +310,19 @@ message DlqMessage {
 
 ## Testing Requirements
 
-### Unit Tests
-- Lease acquisition logic
-- Hydration logic
-- DLQ message construction
-- Error handling scenarios
+### Unit Tests ⚠️ **PARTIAL**
+- Lease acquisition logic ✅ (some tests exist)
+- Hydration logic ✅ (DocumentHydratorTest exists)
+- DLQ message construction ❌ (pending FR5 implementation)
+- Error handling scenarios ✅ (ConsumerManagerRetryTest, EngineClientTest, RequestValidatorTest exist)
 
-### Integration Tests
-- End-to-end flow: Kafka → Hydration → Engine → Commit
-- Lease management with Consul
-- DLQ publishing
-- Failure scenarios (Engine down, Repo Service down)
+### Integration Tests ⚠️ **PARTIAL**
+- End-to-end flow: Kafka → Hydration → Engine → Commit ✅ (hydration retry test exists)
+- Lease management with Consul ⚠️ (tracked in issue #5 - integration tests needed)
+- DLQ publishing ❌ (pending FR5 implementation)
+- Failure scenarios (Engine down, Repo Service down) ✅ (some coverage exists)
 
-### Performance Tests
+### Performance Tests ❌ **NOT DONE**
 - Throughput benchmarks
 - Latency measurements
 - Resource usage under load
@@ -349,6 +369,35 @@ message DlqMessage {
 5. [Repository Service Design](../../../repository-service/DESIGN.md)
 6. [Repository Service: S3 Path Structure](../../../repository-service/docs/S3-PATH-STRUCTURE.md)
 
+## Implementation Status Summary
+
+**Overall Status**: Phase 1 complete, Phase 2 partially complete (DLQ pending), Phase 3 not started
+
+### ✅ Completed Requirements
+- FR1: Topic Consumption (intake + node topics)
+- FR2: Lease Management via Consul
+- FR3: Level 1 Hydration
+- FR4: gRPC Handoff to Engine
+- FR7: Retry Logic
+
+### ❌ Missing Requirements
+- FR5: Dead Letter Queue (DLQ) Publishing
+- FR6.1: Commit offset ONLY after success (blocked by FR5)
+- NFR3: Metrics collection
+- NFR3: Distributed tracing
+- TR4: Circuit breakers
+- Health checks (stub exists, needs implementation)
+
+### ⚠️ Partial Requirements
+- FR6: Offset Management (commits on failure currently to avoid infinite loop; will be complete once DLQ is implemented)
+- NFR3: Observability (logging done, metrics/tracing not done)
+- Testing: Unit/integration tests exist but DLQ tests pending
+
+### Next Priority
+1. **FR5 (DLQ Publishing)** - Required to complete FR6.1 properly
+2. **Phase 3: Observability** - Metrics + health checks
+3. **Phase 4: Advanced Features** - Defer until core is production-ready
+
 ## Open Questions
 
 1. Should sidecar support batch processing (multiple messages before commit)?
@@ -356,5 +405,12 @@ message DlqMessage {
 3. Should sidecar support custom retry policies per topic/node?
 4. Should sidecar expose a management API for lease control?
 5. Should sidecar support message filtering (skip certain messages)?
+
+## References
+
+- [Kafka Sidecar GitHub Issues](https://github.com/ai-pipestream/pipestream-engine-kafka-sidecar/issues)
+  - Issue #3: Implement Hydration & Handoff Loop (core logic - mostly complete, DLQ pending)
+  - Issue #4: Kafka Sidecar Requirements and Implementation Plan (tracking issue)
+  - Issue #5: Consul lease management integration tests + hardening
 
 

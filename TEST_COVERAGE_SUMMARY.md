@@ -1,21 +1,26 @@
 # Engine Service Test Coverage Summary
 
-## ✅ Critical Tests Completed
+**Last Updated**: 2025-12-30
+
+## ✅ Critical Test Suites
 
 ### 1. Blob Hydration Tests (`EngineV1ServiceBlobHydrationTest`)
-**Status**: ✅ **4 tests passing**
+**Status**: ✅ **7+ tests passing**
 
 - ✅ `testParserModuleWithBlobHydration()` - Full blob hydration flow for parser modules
 - ✅ `testNonParserModuleWithoutBlobHydration()` - Skips hydration for non-parser modules
 - ✅ `testBlobHydrationFailure()` - Graceful error handling when GetBlob fails
 - ✅ `testDocumentWithHydratedBlob()` - Skips GetBlob when blob already hydrated
+- ✅ `testMultipleBlobsWithBlobHydration()` - Multi-blob parallel hydration
+- ✅ `testMultipleBlobsPartialHydration()` - Partial hydration scenarios
+- ✅ `testMultipleBlobsNoHydrationNeeded()` - Skips hydration when blobs already hydrated
 
-**Coverage**: Complete blob hydration flow verification
+**Coverage**: Complete blob hydration flow verification (single + multi-blob)
 
 ---
 
 ### 2. Multi-Node Pipeline Tests (`EngineV1ServiceMultiNodePipelineTest`)
-**Status**: ✅ **4 tests passing**
+**Status**: ✅ **4+ tests passing**
 
 - ✅ `testCompleteMultiNodePipeline()` - Processes document through parser → chunker → embedder → sink
 - ✅ `testMetadataAccumulation()` - Verifies metadata and history accumulate correctly
@@ -27,7 +32,7 @@
 ---
 
 ### 3. CEL Routing Tests (`EngineV1ServiceCelRoutingTest`)
-**Status**: ✅ **6 tests passing**
+**Status**: ✅ **6+ tests passing**
 
 - ✅ `testCelConditionTrue()` - Routes to edge when CEL condition is true
 - ✅ `testCelConditionFalse()` - Skips edge when CEL condition is false
@@ -40,65 +45,83 @@
 
 ---
 
+### 4. Additional Test Suites
+
+- ✅ **GraphValidationServiceTest** - Node/edge/module validation
+- ✅ **CelCacheWarmupTest** - CEL expression pre-compilation on graph load
+- ✅ **EngineV1ServiceRetryTest** - Module call retry logic
+- ✅ **EngineV1ServiceStepMetadataTest** - Step execution metadata capture
+- ✅ **EngineV1ServiceDlqTest** - Dead letter queue handling
+- ✅ **GraphCacheTest** - Graph cache reactive operations
+- ✅ **ModuleCapabilityServiceTest** - Module capability detection
+- ✅ **Processing Pipeline Tests** - End-to-end processing scenarios
+
+---
+
 ## 📊 Overall Test Coverage
 
-**Total Engine Tests**: **14 tests** across 3 test classes
+**Total Test Files**: **37+ test classes**
 
-**Test Breakdown**:
-- Blob Hydration: 4 tests
-- Multi-Node Pipeline: 4 tests
-- CEL Routing: 6 tests
+**Key Test Areas**:
+- Blob Hydration (single + multi-blob)
+- Multi-Node Pipeline Processing
+- CEL Routing & Filtering
+- Graph Validation
+- CEL Cache Warmup
+- Retry Logic
+- DLQ Handling
+- Step Metadata
+- Module Capabilities
+- Graph Cache (reactive)
+- Mapping & Field Transformations
 
-**Status**: ✅ **All 14 tests passing**
+**Status**: ✅ **Comprehensive coverage of core functionality**
 
 ---
 
 ## 🎯 Coverage Assessment
 
 ### ✅ Well Covered
-- **Blob Hydration Flow**: Complete end-to-end verification
+- **Blob Hydration Flow**: Complete single + multi-blob coverage
 - **Module Capability Detection**: Comprehensive coverage
 - **Multi-Node Pipeline**: Core functionality verified
 - **CEL Routing**: All routing scenarios covered
+- **Graph Validation**: Node/edge/module validation
+- **CEL Warmup**: Pre-compilation on graph load
+- **Retry Logic**: Module call retries
 - **Error Handling**: Graceful error handling verified
 
-### ⚠️ Partially Covered (Optional Enhancements)
-- **Intake Handoff**: Not yet tested (entry point from Kafka sidecar)
-- **SavePipeDoc**: Not yet tested (persistence after processing)
-- **Cross-Cluster Routing**: Not yet tested (advanced feature)
-- **Streaming Processing**: Not yet tested (advanced feature)
-
-### 📈 Coverage Improvement
-**Before**: ~40% of critical paths
-**After**: ~70% of critical paths
-
-**Assessment**: Engine is now **well-tested** for core functionality. The remaining untested areas (Intake Handoff, SavePipeDoc) are important but can be added incrementally.
+### ⚠️ Partially Covered (Future Enhancements)
+- **Intake Handoff**: Entry point from Kafka sidecar (covered in sidecar repo)
+- **ProcessStream**: Bidirectional streaming (experimental, low priority)
+- **Cross-Cluster Routing**: Advanced feature
+- **Advanced Observability**: Metrics, tracing enhancements
 
 ---
 
 ## 🚀 Production Readiness
 
-**Status**: ✅ **Ready for production** with monitoring
+**Status**: ✅ **Well-tested for production use**
 
-The engine now has comprehensive test coverage for:
+The engine has comprehensive test coverage for:
 - ✅ Core processing flow (multi-node pipeline)
-- ✅ Blob hydration (Level 2 hydration)
+- ✅ Blob hydration (Level 2, single + multi-blob)
 - ✅ Conditional routing (CEL expressions)
-- ✅ Error handling
+- ✅ Graph validation
+- ✅ Error handling & retries
+- ✅ CEL performance (warmup)
+- ✅ DLQ handling
 
 **Recommendation**: 
-- Deploy with monitoring and gradual rollout
-- Add Intake Handoff and SavePipeDoc tests as time permits
-- Monitor production metrics to catch any edge cases
+- Core functionality is production-ready
+- Monitor production metrics for edge cases
+- Incremental enhancement tests as features are added
 
 ---
 
-## 📝 Next Steps (Optional)
+## 📝 Test Infrastructure
 
-1. **Intake Handoff Test** (2-3 hours) - Test entry point from Kafka sidecar
-2. **SavePipeDoc Test** (1-2 hours) - Test persistence after processing
-3. **Error Handling in Multi-Node Scenarios** (2-3 hours) - More comprehensive error scenarios
-
-**Priority**: Low - Core functionality is well-tested. These can be added incrementally.
-
-
+- **WireMock Integration**: Mock services for Repo Service and Modules
+- **Reactive Testing**: Mutiny Uni/Multi test utilities
+- **Graph Cache Testing**: Reactive cache operations
+- **Integration Tests**: End-to-end flow verification
