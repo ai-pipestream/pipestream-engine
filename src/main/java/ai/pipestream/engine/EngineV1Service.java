@@ -12,12 +12,16 @@ import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.PipeStream;
 import ai.pipestream.data.v1.ProcessConfiguration;
 import ai.pipestream.data.v1.StepExecutionRecord;
+import ai.pipestream.engine.dlq.DlqService;
 import ai.pipestream.engine.graph.GraphCache;
 import ai.pipestream.engine.hydration.RepoClient;
 import ai.pipestream.engine.mapping.MappingEngine;
+import ai.pipestream.engine.metrics.EngineMetrics;
+import ai.pipestream.engine.metrics.TracingContextService;
 import ai.pipestream.engine.module.ModuleCapabilityService;
 import ai.pipestream.engine.routing.CelEvaluatorService;
 import ai.pipestream.engine.validation.GraphValidationService;
+import io.micrometer.core.instrument.Timer;
 import ai.pipestream.engine.v1.*;
 import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
 import com.google.protobuf.Timestamp;
@@ -83,6 +87,18 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
     @Inject
     GraphValidationService graphValidationService;
 
+    /** Injected service for publishing failed documents to Dead Letter Queue. */
+    @Inject
+    DlqService dlqService;
+
+    /** Injected metrics service for tracking processing performance. */
+    @Inject
+    EngineMetrics metrics;
+
+    /** Injected service for managing tracing context and MDC correlation. */
+    @Inject
+    TracingContextService tracingContext;
+
     /** Injected factory for creating dynamic gRPC clients for module communication. */
     @Inject
     DynamicGrpcClientFactory grpcClientFactory;
@@ -134,28 +150,44 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
     public Uni<ProcessNodeResponse> processNode(ProcessNodeRequest request) {
         PipeStream stream = request.getStream();
         String nodeId = stream.getCurrentNodeId();
-        
+
+        // Start timing for metrics
+        Timer.Sample timerSample = metrics.startProcessNode();
+
+        // Set up tracing context (MDC and OpenTelemetry)
+        tracingContext.setupContext(stream, nodeId);
+        tracingContext.addSpanAttributes(stream, nodeId);
+
         LOG.debugf("ProcessNode: Stream %s at Node %s", stream.getStreamId(), nodeId);
 
         // Extract accountId from stream metadata (default to empty string if not available)
-        String accountId = stream.hasMetadata() 
-            ? stream.getMetadata().getAccountId() 
+        String accountId = stream.hasMetadata()
+            ? stream.getMetadata().getAccountId()
             : "";
 
         // Validate node exists in graph before processing
         return graphValidationService.validateNodeExists(nodeId, accountId)
             .flatMap(node -> processNodeLogic(stream, node))
-            .map(updatedStream -> ProcessNodeResponse.newBuilder()
-                    .setSuccess(true)
-                    .setUpdatedStream(updatedStream)
-                    .build())
+            .map(updatedStream -> {
+                // Record success metrics
+                metrics.incrementDocSuccess();
+                metrics.stopProcessNode(timerSample, nodeId);
+                return ProcessNodeResponse.newBuilder()
+                        .setSuccess(true)
+                        .setUpdatedStream(updatedStream)
+                        .build();
+            })
             .onFailure().recoverWithItem(t -> {
+                // Record failure metrics
+                metrics.incrementDocFailure();
+                metrics.stopProcessNode(timerSample, nodeId);
                 LOG.errorf("Error processing node %s: %s", nodeId, t.getMessage());
                 return ProcessNodeResponse.newBuilder()
                         .setSuccess(false)
                         .setMessage(t.getMessage())
                         .build();
-            });
+            })
+            .onTermination().invoke(tracingContext::clearContext);
     }
 
     /**
@@ -204,14 +236,8 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                     });
             })
             .onFailure().recoverWithUni(error -> {
-                // Handle save_on_error behavior
-                if (node.getSaveOnError() && stream.hasDocument()) {
-                    LOG.warnf("Module %s failed, saving document due to save_on_error=true: %s",
-                            node.getModuleId(), error.getMessage());
-                    return saveErrorState(stream, node, error)
-                            .flatMap(v -> Uni.createFrom().failure(error));
-                }
-                return Uni.createFrom().failure(error);
+                // Handle error recovery: save_on_error and DLQ publishing
+                return handleProcessingFailure(stream, node, error);
             });
     }
 
@@ -275,6 +301,59 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
         // Create updated stream context with the result document for CEL evaluation
         PipeStream updatedContext = stream.toBuilder().setDocument(resultDoc).build();
         return mappingEngine.applyMappings(resultDoc, node.getPostMappingsList(), updatedContext);
+    }
+
+    /**
+     * Handles processing failures by saving error state and publishing to DLQ.
+     * <p>
+     * The error handling flow:
+     * 1. If save_on_error is enabled, save the document to the repository
+     * 2. If DLQ is enabled for this node, publish a DlqMessage to the DLQ topic
+     * 3. Re-throw the original error after handling
+     * <p>
+     * Both operations (save and DLQ publish) run in parallel for efficiency.
+     * Failures in either operation are logged but don't prevent the other from completing.
+     *
+     * @param stream The stream that failed processing
+     * @param node The node where processing failed
+     * @param error The error that caused the failure
+     * @return A Uni that fails with the original error after handling
+     */
+    private Uni<PipeStream> handleProcessingFailure(PipeStream stream, GraphNode node, Throwable error) {
+        LOG.warnf("Processing failed at node %s for stream %s: %s",
+                node.getNodeId(), stream.getStreamId(), error.getMessage());
+
+        // Build list of error handling operations
+        List<Uni<Void>> errorHandlingOps = new ArrayList<>();
+
+        // 1. Save error state if enabled
+        if (node.getSaveOnError() && stream.hasDocument()) {
+            LOG.debugf("save_on_error=true, saving document for stream %s", stream.getStreamId());
+            errorHandlingOps.add(saveErrorState(stream, node, error));
+        }
+
+        // 2. Publish to DLQ if enabled
+        if (node.getDlqConfig().getEnabled()) {
+            LOG.debugf("DLQ enabled, publishing to DLQ for stream %s", stream.getStreamId());
+            errorHandlingOps.add(dlqService.publishToDlq(stream, node, error));
+        }
+
+        // If no error handling operations, just fail immediately
+        if (errorHandlingOps.isEmpty()) {
+            return Uni.createFrom().failure(error);
+        }
+
+        // Run all error handling operations in parallel, then fail with original error
+        return Uni.join().all(errorHandlingOps).andCollectFailures()
+                .onItem().transformToUni(results -> Uni.createFrom().<PipeStream>failure(error))
+                .onFailure().recoverWithUni(handlingError -> {
+                    // Log any errors from error handling itself, but still fail with original error
+                    if (handlingError != error) {
+                        LOG.errorf(handlingError, "Error during failure handling for stream %s at node %s",
+                                stream.getStreamId(), node.getNodeId());
+                    }
+                    return Uni.createFrom().failure(error);
+                });
     }
 
     /**
@@ -529,6 +608,9 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
     private Uni<PipeDoc> callModule(PipeStream stream, GraphNode node) {
         String moduleId = node.getModuleId();
 
+        // Start timing for module call metrics
+        Timer.Sample moduleTimerSample = metrics.startCallModule();
+
         // Note: stream should already be hydrated via ensureHydration() before this is called
         if (!stream.hasDocument()) {
             LOG.errorf("Cannot call module %s - stream %s does not have a document", moduleId, stream.getStreamId());
@@ -579,6 +661,7 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                                 moduleId, error.getMessage());
                     }
                 })
+                .onTermination().invoke(() -> metrics.stopCallModule(moduleTimerSample, moduleId))
                 .map(response -> {
                     if (!response.getSuccess()) {
                         String errorMsg = "Module processing failed";
@@ -707,6 +790,9 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
      * @return A Uni that completes when dispatch is successful
      */
     private Uni<Void> dispatch(PipeStream stream, GraphEdge edge) {
+        // Start timing for dispatch metrics
+        Timer.Sample dispatchTimerSample = metrics.startDispatch();
+
         PipeStream nextStream = stream.toBuilder()
                 .setCurrentNodeId(edge.getToNodeId())
                 .build();
@@ -717,12 +803,12 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                 LOG.warnf("Cannot dispatch stream %s - document is not hydrated", nextStream.getStreamId());
                 return Uni.createFrom().failure(new IllegalStateException("Document must be hydrated before Kafka dispatch"));
             }
-            
+
             // Use the current node ID as the graph_location_id when saving to repository
             // This identifies which graph node processed this document state
             String graphLocationId = nextStream.getCurrentNodeId();
             String accountId = nextStream.getMetadata().getAccountId();
-            
+
             // Pass currentClusterId so the repository service can organize documents by cluster
             // This determines the S3 path structure: .../{clusterId}/{uuid}.pb
             return repoClient.savePipeDoc(doc, "default", graphLocationId, currentClusterId)
@@ -734,7 +820,7 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                             .setSourceNodeId(graphLocationId)  // proto field name is source_node_id, represents graph_address_id
                             .setAccountId(accountId)
                             .build();
-                            
+
                     PipeStream refStream = nextStream.toBuilder()
                             .clearDocument()
                             .setDocumentRef(docRef)
@@ -750,7 +836,7 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                     }
 
                     LOG.debugf("Routing to Kafka topic: %s", topic);
-                    
+
                     // Extract UUID key for partitioning (ensures same stream goes to same partition)
                     UUID key;
                     try {
@@ -759,18 +845,22 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                         // If not a valid UUID, create deterministic UUID from stream_id
                         key = UUID.nameUUIDFromBytes(refStream.getStreamId().getBytes(java.nio.charset.StandardCharsets.UTF_8));
                     }
-                    
+
                     // For dynamic topics, we need to add topic metadata
                     final String finalTopic = topic;
                     OutgoingKafkaRecordMetadata<UUID> metadata = OutgoingKafkaRecordMetadata.<UUID>builder()
                             .withKey(key)
                             .withTopic(finalTopic)
                             .build();
-                    
+
                     // ProtobufEmitter.send(Message) is void, so we wrap in Uni for reactive composition
                     routingEmitter.send(org.eclipse.microprofile.reactive.messaging.Message.of(refStream)
                             .addMetadata(metadata));
-                    
+
+                    // Record routing metrics
+                    metrics.incrementRoutingDispatched();
+                    metrics.stopDispatch(dispatchTimerSample);
+
                     return Uni.createFrom().voidItem();
                 });
 
