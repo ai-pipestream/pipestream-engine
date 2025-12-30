@@ -20,6 +20,8 @@ import ai.pipestream.engine.v1.*;
 import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
 import com.google.protobuf.Timestamp;
 import com.google.protobuf.util.Timestamps;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
@@ -28,8 +30,10 @@ import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -84,6 +88,25 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
     /** Configuration property defining the current cluster ID for routing decisions. */
     @ConfigProperty(name = "pipestream.cluster.id", defaultValue = "default-cluster")
     String currentClusterId;
+
+    /** Maximum number of retry attempts for module calls (default: 3). */
+    @ConfigProperty(name = "pipestream.module.retry.max-attempts", defaultValue = "3")
+    int moduleRetryMaxAttempts;
+
+    /** Initial delay for exponential backoff in milliseconds (default: 100ms). */
+    @ConfigProperty(name = "pipestream.module.retry.initial-delay-ms", defaultValue = "100")
+    long moduleRetryInitialDelayMs;
+
+    /** Maximum delay for exponential backoff in milliseconds (default: 2000ms). */
+    @ConfigProperty(name = "pipestream.module.retry.max-delay-ms", defaultValue = "2000")
+    long moduleRetryMaxDelayMs;
+
+    /** gRPC status codes that trigger retry (UNAVAILABLE, DEADLINE_EXCEEDED by default). */
+    private static final Set<Status.Code> RETRYABLE_STATUS_CODES = Set.of(
+            Status.Code.UNAVAILABLE,
+            Status.Code.DEADLINE_EXCEEDED,
+            Status.Code.RESOURCE_EXHAUSTED
+    );
 
     /**
      * Processes a single node in the pipeline graph. Inherited from {@link MutinyEngineV1ServiceGrpc.EngineV1ServiceImplBase}.
@@ -391,6 +414,9 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
      * Uses the DynamicGrpcClientFactory to create a client for the module's
      * gRPC service. The service name is resolved from the module definition
      * in the graph cache, falling back to the module ID if not specified.
+     * <p>
+     * Implements retry with exponential backoff for transient failures (UNAVAILABLE,
+     * DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED). Non-retryable errors fail immediately.
      *
      * @param stream The input stream with document to process
      * @param node The node configuration specifying which module to call
@@ -399,7 +425,7 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
      */
     private Uni<PipeDoc> callModule(PipeStream stream, GraphNode node) {
         String moduleId = node.getModuleId();
-        
+
         // Note: stream should already be hydrated via ensureHydration() before this is called
         if (!stream.hasDocument()) {
             LOG.errorf("Cannot call module %s - stream %s does not have a document", moduleId, stream.getStreamId());
@@ -431,6 +457,20 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
 
         return grpcClientFactory.getClient(serviceName, MutinyPipeStepProcessorServiceGrpc::newMutinyStub)
                 .flatMap(stub -> stub.processData(request))
+                .onFailure(this::isRetryableFailure).retry()
+                    .withBackOff(
+                            Duration.ofMillis(moduleRetryInitialDelayMs),
+                            Duration.ofMillis(moduleRetryMaxDelayMs))
+                    .atMost(moduleRetryMaxAttempts)
+                .onFailure().invoke(error -> {
+                    if (isRetryableFailure(error)) {
+                        LOG.warnf("Module %s failed after %d retry attempts: %s",
+                                moduleId, moduleRetryMaxAttempts, error.getMessage());
+                    } else {
+                        LOG.debugf("Module %s failed with non-retryable error: %s",
+                                moduleId, error.getMessage());
+                    }
+                })
                 .map(response -> {
                     if (!response.getSuccess()) {
                         String errorMsg = "Module processing failed";
@@ -441,6 +481,32 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
                     }
                     return response.getOutputDoc();
                 });
+    }
+
+    /**
+     * Determines if a failure is retryable based on gRPC status codes.
+     * <p>
+     * Retryable status codes indicate transient failures that may succeed on retry:
+     * <ul>
+     *   <li>UNAVAILABLE - Service temporarily unavailable (e.g., connection refused)</li>
+     *   <li>DEADLINE_EXCEEDED - Request timeout</li>
+     *   <li>RESOURCE_EXHAUSTED - Rate limiting or quota exceeded</li>
+     * </ul>
+     *
+     * @param throwable The failure to check
+     * @return true if the failure should trigger a retry, false otherwise
+     */
+    private boolean isRetryableFailure(Throwable throwable) {
+        if (throwable instanceof StatusRuntimeException) {
+            Status.Code code = ((StatusRuntimeException) throwable).getStatus().getCode();
+            return RETRYABLE_STATUS_CODES.contains(code);
+        }
+        // Also check for wrapped exceptions
+        if (throwable.getCause() instanceof StatusRuntimeException) {
+            Status.Code code = ((StatusRuntimeException) throwable.getCause()).getStatus().getCode();
+            return RETRYABLE_STATUS_CODES.contains(code);
+        }
+        return false;
     }
 
     /**
