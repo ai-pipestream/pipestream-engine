@@ -103,60 +103,46 @@ message NodeProcessingConfig {
 
 ## Engine: Retry Logic
 
-Engine handles retries for module calls:
+The Engine implements automatic retry with exponential backoff for transient gRPC failures. See [02-processing-loop.md#module-call-retry](./02-processing-loop.md#module-call-retry) for full details.
+
+### Retry Configuration
+
+```properties
+# application.properties
+pipestream.module.retry.max-attempts=3
+pipestream.module.retry.initial-delay-ms=100
+pipestream.module.retry.max-delay-ms=2000
+```
+
+### Retryable Status Codes
+
+Only transient failures trigger retry:
+- `UNAVAILABLE` - Service temporarily down
+- `DEADLINE_EXCEEDED` - Request timeout
+- `RESOURCE_EXHAUSTED` - Rate limiting
+
+Non-retryable errors (INVALID_ARGUMENT, NOT_FOUND, INTERNAL, etc.) fail immediately.
+
+### Integration with save_on_error
+
+After retries are exhausted, the `save_on_error` flag determines behavior:
 
 ```java
-ProcessNodeResponse processNode(ProcessNodeRequest request) {
-    PipeStream stream = request.getStream();
-    GraphNode node = graphCache.getNode(stream.getCurrentNodeId());
-    DlqConfig dlqConfig = node.getDlqConfig();
-    NodeProcessingConfig processingConfig = node.getProcessingConfig();
-    
-    int attempt = 0;
-    Exception lastError = null;
-    
-    while (attempt < dlqConfig.getMaxRetries()) {
-        try {
-            // Call module
-            ProcessDataResponse response = callModule(node, stream.getDocument());
-            
-            if (response.getSuccess()) {
-                // Success - continue routing
-                routeToNextNodes(stream, response.getOutputDoc());
-                return ProcessNodeResponse.newBuilder()
-                    .setSuccess(true)
-                    .build();
-            } else {
-                // Logical failure - log and continue (no retry)
-                logErrorInHistory(stream, response.getErrorDetails());
-                routeToNextNodes(stream, response.getOutputDoc());
-                return ProcessNodeResponse.newBuilder()
-                    .setSuccess(true)  // Processing succeeded, module chose to fail
-                    .build();
+private Uni<PipeStream> processNodeLogic(PipeStream stream, GraphNode node) {
+    return ensureHydration(stream, node)
+        .flatMap(hydratedStream -> {
+            // ... filter, pre-map, module call, post-map ...
+        })
+        .onFailure().recoverWithUni(error -> {
+            // After retry exhaustion, check save_on_error
+            if (node.getSaveOnError() && stream.hasDocument()) {
+                LOG.warnf("Module %s failed, saving document due to save_on_error=true",
+                        node.getModuleId());
+                return saveErrorState(stream, node, error)
+                        .flatMap(v -> Uni.createFrom().failure(error));
             }
-            
-        } catch (ModuleUnavailableException | TimeoutException e) {
-            // Infrastructure failure - retry
-            attempt++;
-            lastError = e;
-            if (attempt < dlqConfig.getMaxRetries()) {
-                waitForBackoff(attempt, dlqConfig.getRetryBackoff());
-            }
-        }
-    }
-    
-    // Exhausted retries
-    if (processingConfig.getSaveOnError()) {
-        // Persist doc and publish to DLQ before returning error
-        publishToDlq(stream, lastError, attempt);
-    }
-    
-    return ProcessNodeResponse.newBuilder()
-        .setSuccess(false)
-        .setErrorMessage(lastError.getMessage())
-        .setErrorType(lastError.getClass().getSimpleName())
-        .setRetryCount(attempt)
-        .build();
+            return Uni.createFrom().failure(error);
+        });
 }
 
 void publishToDlq(PipeStream stream, Exception error, int retryCount) {

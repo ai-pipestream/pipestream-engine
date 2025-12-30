@@ -335,6 +335,81 @@ sequenceDiagram
     M-->>E: ProcessDataResponse
 ```
 
+## Module Call Retry
+
+The engine implements automatic retry with exponential backoff for transient gRPC failures. This ensures resilience against temporary network issues, pod restarts, and rate limiting without manual intervention.
+
+### Retry Configuration
+
+Configure retry behavior via `application.properties`:
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `pipestream.module.retry.max-attempts` | `3` | Maximum retry attempts before failing |
+| `pipestream.module.retry.initial-delay-ms` | `100` | Initial backoff delay (doubles each retry) |
+| `pipestream.module.retry.max-delay-ms` | `2000` | Maximum backoff delay cap |
+
+```properties
+# application.properties
+pipestream.module.retry.max-attempts=3
+pipestream.module.retry.initial-delay-ms=100
+pipestream.module.retry.max-delay-ms=2000
+```
+
+### Retryable vs Non-Retryable Errors
+
+| gRPC Status | Retryable? | Reason |
+|-------------|------------|--------|
+| `UNAVAILABLE` | ✅ Yes | Service temporarily down (connection refused, pod restarting) |
+| `DEADLINE_EXCEEDED` | ✅ Yes | Request timeout - may succeed on retry |
+| `RESOURCE_EXHAUSTED` | ✅ Yes | Rate limiting or quota - back off and retry |
+| `INVALID_ARGUMENT` | ❌ No | Bad request - retrying won't help |
+| `NOT_FOUND` | ❌ No | Resource doesn't exist |
+| `PERMISSION_DENIED` | ❌ No | Authorization failure |
+| `INTERNAL` | ❌ No | Server bug - needs code fix |
+| `UNIMPLEMENTED` | ❌ No | RPC not supported |
+
+### Retry Flow
+
+```mermaid
+flowchart TD
+    Call[gRPC Call] --> Result{Success?}
+    Result -- Yes --> Done[Return Response]
+    Result -- No --> Check{Retryable Status?}
+    Check -- No --> Fail[Return Error Immediately]
+    Check -- Yes --> Attempts{Attempts < Max?}
+    Attempts -- No --> Exhaust[Log Warning, Return Error]
+    Attempts -- Yes --> Backoff[Wait with Exponential Backoff]
+    Backoff --> Call
+```
+
+### Implementation
+
+The retry logic uses Mutiny's reactive retry operators:
+
+```java
+return grpcClientFactory.getClient(serviceName, ...)
+    .flatMap(stub -> stub.processData(request))
+    .onFailure(this::isRetryableFailure).retry()
+        .withBackOff(
+            Duration.ofMillis(moduleRetryInitialDelayMs),
+            Duration.ofMillis(moduleRetryMaxDelayMs))
+        .atMost(moduleRetryMaxAttempts)
+    .onFailure().invoke(error -> {
+        if (isRetryableFailure(error)) {
+            LOG.warnf("Module %s failed after %d retry attempts",
+                moduleId, moduleRetryMaxAttempts);
+        }
+    })
+    .map(response -> ...);
+```
+
+**Key behaviors:**
+- Non-retryable errors fail immediately (no wasted retries)
+- Exponential backoff prevents thundering herd on service recovery
+- Wrapped exceptions are unwrapped to check the underlying gRPC status
+- After retries are exhausted, error propagates to `save_on_error` / DLQ handling
+
 ## Error Handling
 
 The engine employs different strategies depending on the nature of the failure to ensure robustness and observability.
