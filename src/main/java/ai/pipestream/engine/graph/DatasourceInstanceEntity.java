@@ -91,6 +91,10 @@ public class DatasourceInstanceEntity extends PanacheEntityBase {
     @Column(name = "created_at", nullable = false)
     public Instant createdAt;
 
+    /** Timestamp when this instance was last updated. */
+    @Column(name = "updated_at")
+    public Instant updatedAt;
+
     /** User or service that created this instance. */
     @Column(name = "created_by", length = 255)
     public String createdBy;
@@ -188,5 +192,6 @@ public class DatasourceInstanceEntity extends PanacheEntityBase {
                 LOG.warnf(e, "Failed to serialize NodeConfig to JSON for update");
             }
         }
+        this.updatedAt = Instant.now();
     }
 }
