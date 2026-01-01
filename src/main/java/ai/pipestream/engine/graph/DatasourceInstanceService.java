@@ -1,5 +1,6 @@
 package ai.pipestream.engine.graph;
 
+import ai.pipestream.config.v1.PipelineGraph;
 import ai.pipestream.engine.v1.DatasourceInstance;
 import io.quarkus.hibernate.reactive.panache.Panache;
 import io.smallrye.mutiny.Uni;
@@ -8,6 +9,8 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Service for managing DatasourceInstance CRUD operations in PostgreSQL.
@@ -64,8 +67,12 @@ public class DatasourceInstanceService {
                             new IllegalArgumentException("Graph not found: " + graphId + ":" + version));
                     }
 
-                    // TODO: Validate that entry_node_id exists in the graph
-                    // This would require parsing the graph JSON and checking nodes
+                    // Validate that entry_node_id exists in the graph
+                    if (!isValidEntryNode(graphEntity, entryNodeId)) {
+                        return Uni.createFrom().failure(
+                            new IllegalArgumentException("Entry node not found in graph: " + entryNodeId +
+                                ". Valid nodes: " + getNodeIds(graphEntity)));
+                    }
 
                     // Create and persist the entity
                     DatasourceInstanceEntity entity = DatasourceInstanceEntity.create(
@@ -108,21 +115,23 @@ public class DatasourceInstanceService {
                     entity.updateNodeConfig(nodeConfig);
 
                     return entity.<DatasourceInstanceEntity>persist()
-                        .invoke(updated -> {
-                            // Check if graph is active and update GraphCache
+                        .flatMap(updated ->
+                            // Check if graph is active and update GraphCache synchronously
                             graphService.findByGraphIdAndVersion(entity.graphId, entity.version)
-                                .subscribe().with(
-                                    graphEntity -> {
-                                        if (graphEntity != null && graphEntity.isActive) {
-                                            DatasourceInstance proto = updated.toProto();
-                                            graphCache.registerDatasourceInstance(proto, entity.graphId);
-                                            LOG.infof("Updated DatasourceInstance in active GraphCache: %s",
-                                                updated.datasourceInstanceId);
-                                        }
-                                    },
-                                    error -> LOG.warnf("Failed to check graph status: %s", error.getMessage())
-                                );
-                        });
+                                .map(graphEntity -> {
+                                    if (graphEntity != null && graphEntity.isActive) {
+                                        DatasourceInstance proto = updated.toProto();
+                                        graphCache.registerDatasourceInstance(proto, entity.graphId);
+                                        LOG.infof("Updated DatasourceInstance in active GraphCache: %s",
+                                            updated.datasourceInstanceId);
+                                    }
+                                    return updated;
+                                })
+                                .onFailure().recoverWithItem(error -> {
+                                    LOG.warnf("Failed to check graph status: %s", error.getMessage());
+                                    return updated;
+                                })
+                        );
                 })
         );
     }
@@ -272,5 +281,45 @@ public class DatasourceInstanceService {
     public void unloadFromCache(String graphId) {
         LOG.debugf("Unloading DatasourceInstances from cache for graph: %s", graphId);
         graphCache.unregisterDatasourceInstancesByGraph(graphId);
+    }
+
+    // =========================================================================
+    // VALIDATION HELPERS
+    // =========================================================================
+
+    /**
+     * Validates that the entry_node_id exists in the graph's nodes list.
+     *
+     * @param graphEntity The graph entity containing the graph definition
+     * @param entryNodeId The entry node ID to validate
+     * @return true if the node exists in the graph, false otherwise
+     */
+    private boolean isValidEntryNode(PipelineGraphEntity graphEntity, String entryNodeId) {
+        if (entryNodeId == null || entryNodeId.isBlank()) {
+            return false;
+        }
+        PipelineGraph graph = graphEntity.toProto();
+        return graph.getNodesList().stream()
+            .anyMatch(node -> entryNodeId.equals(node.getNodeId()));
+    }
+
+    /**
+     * Gets the set of valid node IDs from a graph (for error messages).
+     *
+     * @param graphEntity The graph entity
+     * @return Comma-separated list of node IDs
+     */
+    private String getNodeIds(PipelineGraphEntity graphEntity) {
+        PipelineGraph graph = graphEntity.toProto();
+        Set<String> nodeIds = graph.getNodesList().stream()
+            .map(node -> node.getNodeId())
+            .collect(Collectors.toSet());
+        if (nodeIds.isEmpty()) {
+            return "(no nodes defined)";
+        }
+        if (nodeIds.size() > 5) {
+            return nodeIds.stream().limit(5).collect(Collectors.joining(", ")) + ", ...";
+        }
+        return String.join(", ", nodeIds);
     }
 }
