@@ -156,11 +156,59 @@ Note: we should keep backward compatibility where possible:
 - May optionally read `IngestContext` hints (index hints, ACLs, retention, etc.).
 - No direct object store access.
 
-## Open Questions
+## Implementation Details (Added 2025-01)
 
-- Exact proto location for `IngestContext`: `StreamMetadata` vs top-level `PipeStream`.
-- How to version datasource instances within a graph (id scheme).
-- Exact repository-service RPC to use for streaming upload (reuse existing NodeUploadService vs new dedicated method).
+### Engine Storage of DatasourceInstances
+
+DatasourceInstances are stored **in-memory** in `GraphCache`, not embedded in the `PipelineGraph` proto. This keeps the proto clean and avoids circular dependencies.
+
+**GraphCache maintains:**
+- `datasourceInstanceMap`: Maps `datasource_id` → `List<DatasourceInstance>` (supports multicast)
+- `graphToDatasourceInstanceIds`: Maps `graphId` → `Set<datasourceInstanceId>` (for efficient unregistration)
+
+**Key methods:**
+- `registerDatasourceInstance(instance, graphId)` - Add instance with graph ownership tracking
+- `registerDatasourceInstances(instances, graphId)` - Bulk registration
+- `unregisterDatasourceInstancesByGraph(graphId)` - Remove all instances for a graph
+- `getDatasourceInstances(datasourceId)` - Get all instances (for multicast routing)
+- `getDatasourceInstance(datasourceId)` - Get first instance (for config lookup)
+
+### IntakeHandoff Processing
+
+When engine receives `IntakeHandoff`:
+1. Look up ALL `DatasourceInstances` for `datasource_id` in `datasourceInstanceMap`
+2. For EACH matching instance:
+   - Merge Tier 2 config (from `node_config`) into `StreamMetadata.ingestion_config`
+   - Route document to `entry_node_id`
+3. If no instances found: document is dropped (acceptable for gRPC inline path)
+
+**Multicast:** One document can route to multiple pipelines if multiple DatasourceInstances exist for the same `datasource_id`.
+
+### GetDatasourceInstance RPC
+
+The `GetDatasourceInstance` RPC is for **debugging, tooling, and admin UIs only** - NOT for intake runtime use. Intake is graph-agnostic and does not query engine for Tier 2 config.
+
+### Tier 2 Config Merge Behavior
+
+Engine merges Tier 2 config from `DatasourceInstance.NodeConfig` into `IngestionConfig`:
+- `hydration_config`: Tier 2 overrides Tier 1
+- `output_hints`: Added from Tier 2 (Tier 1 doesn't have this)
+- `custom_config`: Tier 2 REPLACES Tier 1 (no JSON merge)
+- `persistence_config` / `retention_config`: Engine-internal use only (not merged into IngestionConfig)
+
+### Shared Types
+
+`PersistenceConfig` and `RetentionConfig` are defined in `pipeline_core_types.proto` (shared package), used by both:
+- Tier 1 config (connector-intake-service / datasource-admin)
+- Tier 2 config (engine `DatasourceInstance.NodeConfig`)
+
+This avoids circular proto dependencies.
+
+## Open Questions (Resolved)
+
+- ✅ **IngestContext location**: In `StreamMetadata.ingestion_config`
+- ✅ **DatasourceInstance versioning**: Tracked via `graphToDatasourceInstanceIds` map with explicit graph ownership
+- ✅ **Repository-service RPC**: Use existing `SavePipeDoc` RPC
 
 ## Tickets (to create)
 
