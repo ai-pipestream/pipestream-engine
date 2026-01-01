@@ -935,36 +935,191 @@ public class EngineV1Service extends MutinyEngineV1ServiceGrpc.EngineV1ServiceIm
     }
 
     /**
-     * Handles document intake from the Kafka sidecar. Inherited from {@link MutinyEngineV1ServiceGrpc.EngineV1ServiceImplBase}.
+     * Handles intake-to-engine stream handoff for datasource routing.
+     * Inherited from {@link MutinyEngineV1ServiceGrpc.EngineV1ServiceImplBase}.
      * <p>
      * This is the primary entry point for documents entering the pipeline.
-     * Creates a new stream ID, finds the appropriate entry node for the datasource,
-     * and initiates processing from that entry point.
+     * Creates a new stream ID, finds all DatasourceInstances for the datasource,
+     * merges Tier 2 configuration into ingestion_config, and routes to all
+     * matching entry nodes (multicast when multiple DatasourceInstances exist).
+     * <p>
+     * Intake is graph-agnostic - it only sends datasource_id. Engine handles
+     * all graph resolution, Tier 2 config merge, and multicast routing.
      *
      * @param request The intake request containing the document and datasource identifier
      * @return A Uni that completes with acceptance status and any error messages
      */
     @Override
     public Uni<IntakeHandoffResponse> intakeHandoff(IntakeHandoffRequest request) {
-        return graphCache.getEntryNodeId(request.getDatasourceId())
-            .flatMap(nodeIdOpt -> {
-                if (nodeIdOpt.isEmpty()) {
-                     return Uni.createFrom().failure(new RuntimeException("No entry node for datasource: " + request.getDatasourceId()));
-                }
-                String nodeId = nodeIdOpt.get();
-                
-                PipeStream stream = request.getStream().toBuilder()
-                        .setStreamId(UUID.randomUUID().toString())
-                        .setCurrentNodeId(nodeId)
-                        .setHopCount(0)
-                        .build();
+        String datasourceId = request.getDatasourceId();
+        LOG.debugf("IntakeHandoff: Received request for datasource %s", datasourceId);
 
-                return processNode(ProcessNodeRequest.newBuilder().setStream(stream).build());
-            })
+        // Check for target entry node override (for testing/debugging)
+        if (!request.getTargetEntryNodeId().isEmpty()) {
+            LOG.debugf("IntakeHandoff: Using override entry node %s", request.getTargetEntryNodeId());
+            return processWithEntryNode(request.getStream(), request.getTargetEntryNodeId(), null);
+        }
+
+        // Get all DatasourceInstances for this datasource_id (supports multicast)
+        return graphCache.getDatasourceInstances(datasourceId)
+            .flatMap(instances -> {
+                if (instances.isEmpty()) {
+                    // No DatasourceInstance found - document is intentionally dropped.
+                    // This is NOT an error - acceptable scenarios include:
+                    // - gRPC inline path where documents go to external systems (not pipelines)
+                    // - Datasource configured in datasource-admin but not bound to any graph yet
+                    // Intake should treat accepted=false as "dropped by design", not as an error.
+                    LOG.infof("IntakeHandoff: No DatasourceInstance for datasource %s - document dropped (not an error)", datasourceId);
+                    return Uni.createFrom().item(IntakeHandoffResponse.newBuilder()
+                            .setAccepted(false)
+                            .setMessage("No pipeline configured for datasource (document dropped): " + datasourceId)
+                            .build());
+                }
+
+                // Multicast: Route to ALL matching entry nodes
+                LOG.debugf("IntakeHandoff: Found %d DatasourceInstances for datasource %s", instances.size(), datasourceId);
+
+                // Process first instance synchronously, others in parallel (fire-and-forget style for multicast)
+                DatasourceInstance primaryInstance = instances.get(0);
+
+                // Process additional instances in parallel (for multicast)
+                if (instances.size() > 1) {
+                    for (int i = 1; i < instances.size(); i++) {
+                        DatasourceInstance instance = instances.get(i);
+                        processWithEntryNode(request.getStream(), instance.getEntryNodeId(), instance)
+                            .subscribe().with(
+                                resp -> LOG.debugf("IntakeHandoff multicast: Completed routing to %s (success=%s)",
+                                    instance.getEntryNodeId(), resp.getAccepted()),
+                                error -> LOG.warnf("IntakeHandoff multicast: Failed routing to %s: %s",
+                                    instance.getEntryNodeId(), error.getMessage())
+                            );
+                    }
+                }
+
+                // Return response for primary instance
+                return processWithEntryNode(request.getStream(), primaryInstance.getEntryNodeId(), primaryInstance);
+            });
+    }
+
+    /**
+     * Processes a stream at a specific entry node with optional Tier 2 config merge.
+     *
+     * @param originalStream The original PipeStream from intake
+     * @param entryNodeId The entry node to route to
+     * @param instance Optional DatasourceInstance containing Tier 2 config (null for override path)
+     * @return A Uni with the handoff response
+     */
+    private Uni<IntakeHandoffResponse> processWithEntryNode(PipeStream originalStream, String entryNodeId,
+                                                             DatasourceInstance instance) {
+        // Build the stream with new stream ID and entry node
+        PipeStream.Builder streamBuilder = originalStream.toBuilder()
+                .setStreamId(UUID.randomUUID().toString())
+                .setCurrentNodeId(entryNodeId)
+                .setHopCount(0);
+
+        // Merge Tier 2 config from DatasourceInstance into ingestion_config (if present)
+        if (instance != null && instance.hasNodeConfig()) {
+            streamBuilder.setMetadata(mergeTier2Config(originalStream.getMetadata(), instance.getNodeConfig()));
+        }
+
+        PipeStream stream = streamBuilder.build();
+
+        return processNode(ProcessNodeRequest.newBuilder().setStream(stream).build())
             .map(resp -> IntakeHandoffResponse.newBuilder()
                     .setAccepted(resp.getSuccess())
                     .setMessage(resp.getMessage())
+                    .setAssignedStreamId(stream.getStreamId())
+                    .setEntryNodeId(entryNodeId)
                     .build());
+    }
+
+    /**
+     * Merges Tier 2 (per-node) configuration from DatasourceInstance into StreamMetadata.
+     * <p>
+     * Tier 2 config overrides Tier 1 config (already in metadata from intake).
+     * Only non-null/non-default values from NodeConfig are merged.
+     *
+     * @param originalMetadata The original StreamMetadata with Tier 1 config
+     * @param nodeConfig The Tier 2 NodeConfig from DatasourceInstance
+     * @return Updated StreamMetadata with merged configuration
+     */
+    private ai.pipestream.data.v1.StreamMetadata mergeTier2Config(
+            ai.pipestream.data.v1.StreamMetadata originalMetadata,
+            DatasourceInstance.NodeConfig nodeConfig) {
+
+        ai.pipestream.data.v1.StreamMetadata.Builder metadataBuilder = originalMetadata.toBuilder();
+
+        // Get or create ingestion_config
+        ai.pipestream.data.v1.IngestionConfig.Builder ingestionConfigBuilder;
+        if (originalMetadata.hasIngestionConfig()) {
+            ingestionConfigBuilder = originalMetadata.getIngestionConfig().toBuilder();
+        } else {
+            ingestionConfigBuilder = ai.pipestream.data.v1.IngestionConfig.newBuilder();
+        }
+
+        // Merge hydration_config (Tier 2 overrides Tier 1)
+        if (nodeConfig.hasHydrationConfig()) {
+            ingestionConfigBuilder.setHydrationConfig(nodeConfig.getHydrationConfig());
+            LOG.debugf("IntakeHandoff: Merged Tier 2 hydration_config");
+        }
+
+        // Merge output_hints (Tier 2 only, not in Tier 1)
+        if (nodeConfig.hasOutputHints()) {
+            ingestionConfigBuilder.setOutputHints(nodeConfig.getOutputHints());
+            LOG.debugf("IntakeHandoff: Merged Tier 2 output_hints");
+        }
+
+        // Merge custom_config (Tier 2 replaces Tier 1 - no JSON merge, just override)
+        if (nodeConfig.hasCustomConfig()) {
+            ingestionConfigBuilder.setCustomConfig(nodeConfig.getCustomConfig());
+            LOG.debugf("IntakeHandoff: Replaced custom_config with Tier 2 override");
+        }
+
+        // Note: persistence_config and retention_config from Tier 2 are for engine-internal use
+        // They're not merged into ingestion_config (intake already handled persistence)
+
+        metadataBuilder.setIngestionConfig(ingestionConfigBuilder.build());
+        return metadataBuilder.build();
+    }
+
+    /**
+     * Retrieves a DatasourceInstance configuration for a datasource.
+     * Inherited from {@link MutinyEngineV1ServiceGrpc.EngineV1ServiceImplBase}.
+     * <p>
+     * Intended for debugging, tooling, and admin UIs - NOT for intake runtime use.
+     * Intake is graph-agnostic and does not query engine for Tier 2 config.
+     * <p>
+     * Engine searches all active graphs to find DatasourceInstances with the specified
+     * datasource_id. If multiple exist, returns the first one found. Actual routing
+     * during IntakeHandoff will route to ALL matching DatasourceInstances.
+     *
+     * @param request The request containing the datasource_id to look up
+     * @return A Uni that completes with the DatasourceInstance if found, or not-found response
+     */
+    @Override
+    public Uni<GetDatasourceInstanceResponse> getDatasourceInstance(GetDatasourceInstanceRequest request) {
+        String datasourceId = request.getDatasourceId();
+        LOG.debugf("GetDatasourceInstance: Looking up datasource %s", datasourceId);
+
+        return graphCache.getDatasourceInstance(datasourceId)
+            .map(instanceOpt -> {
+                if (instanceOpt.isPresent()) {
+                    DatasourceInstance instance = instanceOpt.get();
+                    LOG.debugf("GetDatasourceInstance: Found %s → entry node %s",
+                        instance.getDatasourceInstanceId(), instance.getEntryNodeId());
+                    return GetDatasourceInstanceResponse.newBuilder()
+                            .setFound(true)
+                            .setInstance(instance)
+                            .setMessage("DatasourceInstance found")
+                            .build();
+                } else {
+                    LOG.debugf("GetDatasourceInstance: No instance found for datasource %s", datasourceId);
+                    return GetDatasourceInstanceResponse.newBuilder()
+                            .setFound(false)
+                            .setMessage("No DatasourceInstance found for datasource: " + datasourceId)
+                            .build();
+                }
+            });
     }
 
     /**
