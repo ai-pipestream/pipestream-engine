@@ -187,7 +187,7 @@ Dev mode automatically starts:
 
 | Property | Default | Description |
 |----------|---------|-------------|
-| `quarkus.http.port` | `38103` | Engine HTTP/gRPC port |
+| `quarkus.http.port` | `38100` | Engine HTTP/gRPC port |
 | `pipestream.engine.instance-id` | `${HOSTNAME}` | Service instance identifier |
 | `pipestream.dlq.global-topic` | `pipestream.global.dlq` | Default DLQ topic |
 | `pipestream.dlq.max-reprocess-count` | `3` | Max DLQ retry attempts before quarantine |

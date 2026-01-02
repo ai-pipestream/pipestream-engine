@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Pipestream Engine Startup Script
-# Port: 38103 (Engine Service)
+# Port: 38100 (Engine Service)
 # This script helps start the engine service in development mode
 # with proper environment variable detection and instance management.
 
@@ -66,7 +66,7 @@ fi
 
 # Service configuration
 SERVICE_NAME="Pipestream Engine"
-SERVICE_PORT="38103"
+SERVICE_PORT="38100"
 DESCRIPTION="Pure gRPC orchestration engine for document processing pipelines"
 
 # Check dependencies

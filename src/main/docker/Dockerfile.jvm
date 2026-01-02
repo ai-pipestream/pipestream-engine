@@ -11,16 +11,16 @@
 #
 # Then run the container using:
 #
-# docker run -i --rm -p 38103:38103 quarkus/pipestream-engine-jvm
+# docker run -i --rm -p 38100:38100 quarkus/pipestream-engine-jvm
 #
 # If you want to include the debug port into your docker image
-# you will have to expose the debug port (default 5005 being the default) like this :  EXPOSE 38103 5005.
+# you will have to expose the debug port (default 5005 being the default) like this :  EXPOSE 38100 5005.
 # Additionally you will have to set -e JAVA_DEBUG=true and -e JAVA_DEBUG_PORT=*:5005
 # when running the container
 #
 # Then run the container using :
 #
-# docker run -i --rm -p 38103:38103 quarkus/pipestream-engine-jvm
+# docker run -i --rm -p 38100:38100 quarkus/pipestream-engine-jvm
 #
 # This image uses the `run-java.sh` script to run the application.
 # This scripts computes the command line to execute your Java application, and
@@ -97,12 +97,12 @@ COPY --chown=185 build/quarkus-app/*.jar /deployments/
 COPY --chown=185 build/quarkus-app/app/ /deployments/app/
 COPY --chown=185 build/quarkus-app/quarkus/ /deployments/quarkus/
 
-EXPOSE 38103
+EXPOSE 38100
 USER 185
 
 # Health check using Quarkus health endpoint
 HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:38103/q/health || exit 1
+    CMD curl -f http://localhost:38100/q/health || exit 1
 
 ENV JAVA_OPTS_APPEND="-Dquarkus.http.host=0.0.0.0 -Djava.util.logging.manager=org.jboss.logmanager.LogManager"
 ENV JAVA_APP_JAR="/deployments/quarkus-run.jar"
